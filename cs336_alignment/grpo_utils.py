@@ -380,32 +380,15 @@ def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
     raw_rewards: Optional[torch.Tensor] = None,
     advantages: Optional[torch.Tensor] = None,
     old_log_probs: Optional[torch.Tensor] = None,
     cliprange: Optional[float] = None,
-    length_norm_type="mask_mean" # 可选: "mask_mean" (token-level) 或 "mask_normalize" (sentence-level)
+    constant_normalizer: Optional[float] = None,
+    length_norm_type="mask_mean" # 可选: "mask_mean" 或 "mask_normalize"
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    执行 GRPO 的单次 micro-batch 更新。
-    包括计算策略梯度损失、掩码平均聚合以及梯度缩放后的反向传播。
 
-    Args:
-        policy_log_probs: 当前策略的对数概率 (Batch, Seq).
-        response_mask: 掩码 (Batch, Seq)，1 为 Response，0 为 Prompt/Padding。
-        gradient_accumulation_steps: 梯度累积步数。
-        loss_type: 损失函数类型。
-        raw_rewards: 原始奖励 (Batch, 1)。
-        advantages: 优势 (Batch, 1)。
-        old_log_probs: 旧策略对数概率 (Batch, Seq)。
-        cliprange: 截断参数 epsilon。
-
-    Returns:
-        loss: 缩放后的标量 Loss (已包含梯度累积因子)。
-        metadata: 包含原始 Loss 和其他统计信息的字典。
-    """
-    
     # 1. 计算 Per-token Loss
     # 调用之前的 Wrapper，得到形状为 (Batch, Seq) 的 Loss 矩阵
     per_token_loss, loss_metadata = compute_policy_gradient_loss(
@@ -421,14 +404,8 @@ def grpo_microbatch_train_step(
     # 第一步：沿序列维度 (dim=1) 计算每个样本的平均 Loss
     # 结果形状: (Batch,)
     if length_norm_type == "mask_mean":
-        # [方案 A] Token-level: 每个 token 的权重是平等的 (1/L_actual)
-        # 使用之前实现的 masked_mean，每条序列除以它自己的有效长度
         per_example_loss = masked_mean(per_token_loss, response_mask, dim=1)
     else:
-        # [方案 B] Sentence-level: 每个 token 的权重被固定常数稀释 (1/C)
-        # 对应 PDF 中的 masked_normalize 逻辑
-        # 假设 constant 等于序列最大长度（如 1024）
-        constant_normalizer = per_token_loss.size(1) 
         per_example_loss = masked_normalize(per_token_loss, response_mask, constant_normalizer, dim=1)
 
     
@@ -525,7 +502,7 @@ def log_generations(
 
     # 4. 记录到日志系统
     if wandb.run is not None:
-        # 记录表格：在 WandB 的 'Media' 或 'Custom Charts' 区域查看
+        # 记录表格
         columns = ["grpo_step", "prompt", "response", "ground_truth", "reward", "format_reward", "answer_reward"]
         wandb.log({f"{log_prefix}/samples": wandb.Table(columns=columns, data=table_data)}, step=step)
         # 记录标量数值

@@ -1,5 +1,5 @@
 #!/bin/bash
-# export CUDA_VISIBLE_DEVICES='0,3'
+# export CUDA_VISIBLE_DEVICES='1,3'
 # uv run bash cs336_alignment/run_grpo_offpolicy.sh
 # ================= 1. 基础路径与项目配置 =================
 BASE_MODEL="model/Qwen2.5-Math-1.5B" 
@@ -24,22 +24,22 @@ ANCHOR_BATCH=256
 # ================= 3. 定义具体的实验配置列表 =================
 # 格式为 "Epochs:TrainBatchSize"
 CONFIGS=(
-    "1:256"   
-    "1:64"    
-    "1:128"  
-    "3:64" 
-    "3:128" 
-    "3:256"    
+    # "1:64"    
     "2:64"    
-    "2:256"   
+    "3:64" 
+    "1:128"  
     "2:128"  
+    # "3:128" 
+    # "1:256"   
+    # "2:256"   
+    # "3:256"    
 )
 
 # ================= 4. 硬件与通用超参 =================
 MICRO_BS=8        # 物理显存 Batch Size
 ROLLOUT_SIZE=256   # 采样总数
 GROUP_SIZE=8       # G
-N_STEPS=200        # 总迭代步数
+N_STEPS=100        # 总迭代步数
 SEED=42
 
 # ================= 5. 循环执行实验 =================
@@ -53,8 +53,8 @@ for CFG in "${CONFIGS[@]}"; do
     IFS=":" read -r E TB <<< "$CFG"
 
     # --- 关键逻辑：动态计算超参数 ---
-    # 1. 计算学习率: LR = Anchor_LR * (1/sqrt(E)) * (TB / Anchor_Batch)
-    LR=$(awk "BEGIN {print $ANCHOR_LR * (1/sqrt($E)) * ($TB/$ANCHOR_BATCH)}")
+    # 1. 计算学习率: LR = Anchor_LR * (TB / Anchor_Batch)
+    LR=$(awk "BEGIN {print $ANCHOR_LR * ($TB/$ANCHOR_BATCH)}")
     
     # 2. 计算梯度累积步数: AccumSteps = TB / MicroBS
     ACCUM_STEPS=$((TB / MICRO_BS))
@@ -88,7 +88,7 @@ for CFG in "${CONFIGS[@]}"; do
         --length_norm_type "mask_normalize" \
         --device cuda:0 \
         --vllm_device cuda:1 \
-        --vllm_gpu_util 0.3 \
+        --vllm_gpu_util 0.25 \
         --eval_every_steps 8 \
         --wandb_project "$WANDB_PROJECT" \
         --wandb_run_name "$RUN_NAME" \

@@ -14,17 +14,13 @@ OUTPUT_BASE="result/grpo_std"
 WANDB_PROJECT="cs336-grpo-math12k-after-base-std"
 
 BEST_LR=3e-5 
-N_STEPS=200
+N_STEPS=100
 
 # ================= 定义实验矩阵 =================
-# 格式: "长度归一化方式:是否使用标准差"
-# 1. mask_mean:with_std      -> Token-level 标准版
-# 2. mask_mean:no_std        -> Token-level 简化版 (Dr. GRPO)
-# 3. mask_normalize:no_std   -> Sentence-level 推理版 (R1 风格)
 EXPERIMENTS=(
-    "mask_mean:with_std"
-    "mask_mean:no_std"
+    "mask_normalize:with_std"
     "mask_normalize:no_std"
+    # "mask_mean:no_std"
 )
 
 for EXP in "${EXPERIMENTS[@]}"; do

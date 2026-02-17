@@ -28,8 +28,6 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_rewar
 # ==========================================
 # 辅助函数
 # ==========================================
-
-
 def load_math12k_dataset(path, prompt_template=None):
     df = pd.read_parquet(path)
     processed_items = []
@@ -119,7 +117,7 @@ def run_grpo_training(args):
 
     # 定义评估用的采样参数 
     eval_sampling_params = SamplingParams(
-        temperature=1.0, # 作业要求 1.0
+        temperature=0.0,
         max_tokens=args.sampling_max_tokens,
         stop=["</answer>"],
         include_stop_str_in_output=True
@@ -135,7 +133,7 @@ def run_grpo_training(args):
         torch_dtype=torch.bfloat16, 
         attn_implementation="flash_attention_2"
     ).to(args.device)
-    # 开启梯度检查点 (关键)
+    # 开启梯度检查点
     policy.gradient_checkpointing_enable()
     
     optimizer = AdamW(policy.parameters(), lr=args.lr, weight_decay=0.0)
@@ -222,105 +220,153 @@ def run_grpo_training(args):
         }, step=step + 1)
 
         # ==========================================
-        # Phase 2: 准备训练数据
+        # Phase 2: 准备训练数据 (过滤与重采样)
         # ==========================================
-        all_inputs = tokenize_prompt_and_output(
-            flat_prompts, flat_responses, tokenizer
-        )
+        print(f">> 正在进行长度过滤 (Max: {args.max_len})...")
         
-        # 截断处理
-        max_len = args.max_len
-        input_ids_tensor = all_inputs['input_ids']
-        if input_ids_tensor.size(1) > max_len:
-            all_input_ids = input_ids_tensor[:, :max_len].to(args.device)
-            all_labels = all_inputs['labels'][:, :max_len].to(args.device)
-            all_masks = all_inputs['response_mask'][:, :max_len].to(args.device)
+        # 1. 过滤：获取长度合格的原始索引
+        # 使用列表推导式提升代码整洁度
+        valid_indices = [
+            i for i, (p, r) in enumerate(zip(flat_prompts, flat_responses))
+            if len(tokenizer.encode(p + r, add_special_tokens=False)) <= args.max_len
+        ]
+        
+        num_valid = len(valid_indices)
+        if num_valid == 0:
+            print(f"⚠️ 警告: 当前批次所有样本均超过 {args.max_len}，跳过训练。")
+            continue
             
+        # 2. 重采样补齐：确保数据量达到训练要求的 Batch Size
+        if num_valid < args.train_batch_size:
+            gap = args.train_batch_size - num_valid
+            print(f"⚠️ 有效样本({num_valid})不足，随机补齐缺口({gap})...")
+            # 允许重复采样有效索引
+            extra_indices = np.random.choice(valid_indices, size=gap, replace=True)
+            final_indices = valid_indices + extra_indices.tolist()
         else:
-            all_input_ids = input_ids_tensor.to(args.device)
-            all_labels = all_inputs['labels'].to(args.device)
-            all_masks = all_inputs['response_mask'].to(args.device)
-            
-        advantages = advantages.to(args.device)
-        raw_rewards = raw_rewards.to(args.device)
+            final_indices = valid_indices
+
+        # 3. 同步更新文本列表与奖励张量
+        filtered_prompts = [flat_prompts[i] for i in final_indices]
+        filtered_responses = [flat_responses[i] for i in final_indices]
+        
+        # 必须先基于索引对 Tensor 进行切片，再移动到 GPU
+        # 注意：此处切片会自动处理重采样导致的重复行
+        advantages = advantages[final_indices].to(args.device)
+        raw_rewards = raw_rewards[final_indices].to(args.device)
+
+        # 4. 张量化 (Tokenization)
+        all_inputs = tokenize_prompt_and_output(filtered_prompts, filtered_responses, tokenizer)
+        all_input_ids = all_inputs['input_ids'].to(args.device)
+        all_labels = all_inputs['labels'].to(args.device)
+        all_masks = all_inputs['response_mask'].to(args.device)
+        
+        print(f">> 处理完成: 采样 {len(flat_responses)} -> 有效训练样本 {all_input_ids.size(0)}")
+
+        # 5. 计算 Old Log Probs (必须在补齐后进行，且精度需对齐)
         policy.eval()
-        # 计算 Old Log Probs (用于 Clip)
-        with torch.no_grad():
+        with torch.no_grad(): # 关键：确保精度与训练阶段(BF16)完全一致
             old_log_probs_list = []
-            for i in range(0, len(all_input_ids), micro_train_batch_size):
+            for i in range(0, all_input_ids.size(0), micro_train_batch_size):
                 batch_ids = all_input_ids[i : i + micro_train_batch_size]
                 batch_lbls = all_labels[i : i + micro_train_batch_size]
                 res = get_response_log_probs(policy, batch_ids, batch_lbls)
                 old_log_probs_list.append(res['log_probs'])
             old_log_probs = torch.cat(old_log_probs_list, dim=0)
+        
+        # ==========================================
+        # Phase 3: 训练 
+        # ==========================================
+        actual_train_size = all_input_ids.size(0)
+        num_updates_per_epoch = actual_train_size // args.train_batch_size
+        
+        if num_updates_per_epoch == 0:
+            print("⚠️ 剩余样本不足一个训练 Batch，跳过此步更新。")
+            continue
 
-        # ==========================================
-        # Phase 3: 训练 (Training Loop)
-        # ==========================================
-        dataset_indices = list(range(len(flat_responses)))
         policy.train()
         for epoch in range(args.epochs_per_rollout_batch):
-            random.shuffle(dataset_indices)
+            # ⚠️ 关键修正：打乱实际训练样本的索引
+            dataset_indices = np.random.permutation(actual_train_size)
             
-            for i in range(0, len(dataset_indices), micro_train_batch_size):
-                batch_idxs = dataset_indices[i : i + micro_train_batch_size]
+            for update_step in range(num_updates_per_epoch):
+                # 2. 锁定当前“逻辑 Batch”的索引范围
+                logical_batch_start = update_step * args.train_batch_size
+                logical_batch_end = (update_step + 1) * args.train_batch_size
+                logical_indices = dataset_indices[logical_batch_start : logical_batch_end]
                 
-                batch_input_ids = all_input_ids[batch_idxs]
-                batch_labels = all_labels[batch_idxs]
-                batch_masks = all_masks[batch_idxs]
-                batch_advantages = advantages[batch_idxs]
-                batch_old_log_probs = old_log_probs[batch_idxs]
-                batch_raw_rewards = raw_rewards[batch_idxs]
+                # 清空上一逻辑步的梯度
+                optimizer.zero_grad()
                 
-                # Forward
-                current_res = get_response_log_probs(
-                    policy, batch_input_ids, batch_labels, return_token_entropy=True
-                )
-                
-                # Loss & Backward
-                loss, loss_meta = grpo_microbatch_train_step(
-                    policy_log_probs=current_res['log_probs'],
-                    response_mask=batch_masks,
-                    gradient_accumulation_steps=args.gradient_accumulation_steps,
-                    loss_type=args.loss_type,
-                    raw_rewards=batch_raw_rewards.unsqueeze(1),
-                    advantages=batch_advantages.unsqueeze(1),
-                    old_log_probs=batch_old_log_probs,
-                    cliprange=0.2,
-                    length_norm_type=args.length_norm_type
-                )
-                
-                # Logging
-                if (global_step + 1) % 10 == 0:
-                    wandb.log({
-                        "train/loss": loss_meta['loss'],
-                        "train/clip_fraction": loss_meta.get('clip_fraction', 0),
-                        "train/ratio_mean": loss_meta.get('ratio_mean', 0),
-                        "train/entropy": current_res['token_entropy'].mean().item(),
-                        "train_step": global_step # 用于内部监控的 X 轴
-                    }, step=step + 1) # 强制与当前 GRPO 步数对齐
+                # 用于累积监控指标
+                batch_loss = 0
+                batch_clip_frac = 0
 
-            # 更新参数 (在一个 epoch 结束后，或者积累了足够步数后)
-            # 这里的逻辑是：一次 Rollout 的数据正好填满 gradient_accumulation_steps
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            global_step += 1
-        
+                # 3. 开启“梯度累积循环” (内层循环)
+                for micro_step in range(args.gradient_accumulation_steps):
+                    # 计算当前物理 Micro-batch 在逻辑 Batch 里的切片位置
+                    m_start = micro_step * micro_train_batch_size
+                    m_end = (micro_step + 1) * micro_train_batch_size
+                    micro_indices = logical_indices[m_start : m_end]
+                    
+                    # --- A. 准备 Micro-batch 数据 ---
+                    mb_input_ids = all_input_ids[micro_indices]
+                    mb_labels = all_labels[micro_indices]
+                    mb_masks = all_masks[micro_indices]
+                    mb_advs = advantages[micro_indices].unsqueeze(1) # 转为 [B, 1] 以便广播
+                    mb_old_lps = old_log_probs[micro_indices]
+                    mb_raw_r = raw_rewards[micro_indices].unsqueeze(1)
+
+                    # --- B. 前向传播计算当前 Log-probs ---
+                    res = get_response_log_probs(
+                        policy, mb_input_ids, mb_labels, return_token_entropy=True
+                    )
+                    
+                    # --- C. 执行单步微批次更新 (包含 backward) ---
+                    # 注意：函数内部执行了 scaled_loss.backward()
+                    # 梯度会累加在参数的 .grad 中
+                    _, loss_meta = grpo_microbatch_train_step(
+                        policy_log_probs=res['log_probs'],
+                        response_mask=mb_masks,
+                        gradient_accumulation_steps=args.gradient_accumulation_steps,
+                        loss_type=args.loss_type,
+                        raw_rewards=mb_raw_r,
+                        advantages=mb_advs,
+                        old_log_probs=mb_old_lps,
+                        cliprange=0.2,
+                        length_norm_type=args.length_norm_type,
+                        constant_normalizer = args.max_len
+                    )
+                    
+                    # 累加指标用于后续 WandB
+                    batch_loss += loss_meta['loss'].item()
+                    batch_clip_frac += loss_meta.get('clip_fraction', 0)
+
+                # 4. 一个逻辑 Batch 累积完成，执行权重更新
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                optimizer.step()
+                global_step += 1
+                # --- 日志记录 ---
+                if global_step % 5 == 0:
+                    wandb.log({
+                        "train/loss": batch_loss / args.gradient_accumulation_steps,
+                        "train/clip_fraction": batch_clip_frac / args.gradient_accumulation_steps,
+                        "train_step": global_step,
+                        "train/grad_norm": grad_norm.item()
+                    }, step=step + 1) 
+
         progress_bar.update(1)
 
         # ==========================================
-        # Phase 4: 评估与保存 (Moved Here!)
+        # Phase 4: 评估与保存 
         # ==========================================
         
-        # 1. 评估逻辑 (每隔 N 个 GRPO Step)
+        # 1. 评估逻辑 (每隔 args.eval_every_steps 个 GRPO Step)
         if (step + 1) % args.eval_every_steps == 0:
             print(f"\n[GRPO Step {step + 1}] Starting Evaluation...")
             policy.eval() 
             load_policy_into_vllm_instance(policy, vllm_inst)
             
-            # 调用更新后的 log_generations
-            # 传入 step+1 作为统一的时间戳
             metrics = log_generations(
                 vllm_model=vllm_inst,
                 sampling_params=eval_sampling_params,
@@ -362,8 +408,6 @@ if __name__ == "__main__":
     parser.add_argument("--train_batch_size", type=int, default=256)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=128)
     parser.add_argument("--epochs_per_rollout_batch", type=int, default=1)
-    
-    
     
     # 采样参数
     parser.add_argument("--sampling_temperature", type=float, default=1.0)

@@ -1,16 +1,21 @@
 #!/bin/bash
-# export CUDA_VISIBLE_DEVICES='1,3'
+# export CUDA_VISIBLE_DEVICES='2,3'
 # ================= 配置区 =================
 BASE_MODEL="model/Qwen2.5-Math-1.5B"
-TRAIN_DATA="data/gsm8k/train.jsonl"
-VAL_DATA="data/gsm8k/test.jsonl"
+# TRAIN_DATA="data/gsm8k/train.jsonl"
+# VAL_DATA="data/gsm8k/test.jsonl"
+# WANDB_PROJECT="cs336-grpo-after-base-length-norm"
+TRAIN_DATA="data/math12k/data/train-00000-of-00001.parquet"
+VAL_DATA="data/math12k/data/test-00000-of-00001.parquet"
+WANDB_PROJECT="cs336-grpo-math12k-after-base-length-norm"
+
 PROMPT_TEMPLATE="cs336_alignment/prompts/r1_zero.prompt"
 OUTPUT_BASE="result/ablation_length_norm"
-WANDB_PROJECT="cs336-grpo-after-base-length-norm"
+
 
 # 实验参数
 BEST_LR=3e-5
-N_STEPS=200
+N_STEPS=100
 
 # ================= 消融循环 =================
 # 1. mask_mean: Token-level (传统 SFT 风格，倾向于生成短回答，梯度被长度稀释)
@@ -39,7 +44,7 @@ for NORM_TYPE in "mask_mean" "mask_normalize"; do
         --use_std_normalization \
         --device cuda:0 \
         --vllm_device cuda:1 \
-        --vllm_gpu_util 0.5 \
+        --vllm_gpu_util 0.25 \
         --eval_every_steps 8 \
         --wandb_project "$WANDB_PROJECT" \
         --wandb_run_name "$RUN_NAME"
