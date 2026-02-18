@@ -20,7 +20,6 @@ N_STEPS=100
 EXPERIMENTS=(
     "mask_normalize:with_std"
     "mask_normalize:no_std"
-    # "mask_mean:no_std"
 )
 
 for EXP in "${EXPERIMENTS[@]}"; do
@@ -58,11 +57,11 @@ for EXP in "${EXPERIMENTS[@]}"; do
         --rollout_batch_size 256 \
         --group_size 8 \
         --train_batch_size 256 \
-        --gradient_accumulation_steps 128 \
+        --gradient_accumulation_steps 32 \
         --loss_type "grpo_clip" \
         --device cuda:0 \
-        --vllm_device cuda:1 \
-        --vllm_gpu_util 0.5 \
+        --vllm_device cuda:0 \
+        --vllm_gpu_util 0.3 \
         --eval_every_steps 8 \
         --wandb_project "$WANDB_PROJECT" \
         --wandb_run_name "$RUN_NAME" \

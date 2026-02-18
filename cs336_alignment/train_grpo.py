@@ -273,7 +273,9 @@ def run_grpo_training(args):
                 res = get_response_log_probs(policy, batch_ids, batch_lbls)
                 old_log_probs_list.append(res['log_probs'])
             old_log_probs = torch.cat(old_log_probs_list, dim=0)
-        
+
+        del old_log_probs_list # 显式删除不再需要的中间大列表
+        torch.cuda.empty_cache() # 确保进入 Phase 3 训练时显存最空
         # ==========================================
         # Phase 3: 训练 
         # ==========================================
@@ -286,7 +288,7 @@ def run_grpo_training(args):
 
         policy.train()
         for epoch in range(args.epochs_per_rollout_batch):
-            # ⚠️ 关键修正：打乱实际训练样本的索引
+            # 打乱实际训练样本的索引
             dataset_indices = np.random.permutation(actual_train_size)
             
             for update_step in range(num_updates_per_epoch):
@@ -301,6 +303,8 @@ def run_grpo_training(args):
                 # 用于累积监控指标
                 batch_loss = 0
                 batch_clip_frac = 0
+                batch_avg_response_entropy = 0
+                batch_avg_global_entropy = 0
 
                 # 3. 开启“梯度累积循环” (内层循环)
                 for micro_step in range(args.gradient_accumulation_steps):
@@ -338,9 +342,20 @@ def run_grpo_training(args):
                         constant_normalizer = args.max_len
                     )
                     
+                    
+                    with torch.no_grad():
+                        token_entropy = res['token_entropy']
+                        valid_token_mask = (mb_labels != tokenizer.pad_token_id)
+                        current_res_mask = mb_masks.bool() & valid_token_mask
+                        
+                        avg_res_entropy = token_entropy[current_res_mask].mean().item() if current_res_mask.any() else 0.0
+                        avg_global_entropy = token_entropy[valid_token_mask].mean().item()
+                    
                     # 累加指标用于后续 WandB
                     batch_loss += loss_meta['loss'].item()
                     batch_clip_frac += loss_meta.get('clip_fraction', 0)
+                    batch_avg_response_entropy += avg_res_entropy
+                    batch_avg_global_entropy += avg_global_entropy
 
                 # 4. 一个逻辑 Batch 累积完成，执行权重更新
                 grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
@@ -352,10 +367,13 @@ def run_grpo_training(args):
                         "train/loss": batch_loss / args.gradient_accumulation_steps,
                         "train/clip_fraction": batch_clip_frac / args.gradient_accumulation_steps,
                         "train_step": global_step,
-                        "train/grad_norm": grad_norm.item()
+                        "train/grad_norm": grad_norm.item(),
+                        "train/response_entropy": batch_avg_response_entropy / args.gradient_accumulation_steps,
+                        "train/global_entropy": batch_avg_global_entropy / args.gradient_accumulation_steps,
                     }, step=step + 1) 
 
         progress_bar.update(1)
+        torch.cuda.empty_cache()
 
         # ==========================================
         # Phase 4: 评估与保存 

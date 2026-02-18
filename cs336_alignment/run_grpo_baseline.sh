@@ -18,24 +18,16 @@ OUTPUT_BASE="result/grpo_baseline_study"
 
 
 # 消融实验目标
-# 1. reinforce_with_baseline: 标准 GRPO (带均值/标准差归一化)
-# 2. no_baseline: 朴素策略梯度 (直接用原始 Reward)
-# 3. grpo_clip
-LOSS_TYPES=("grpo_clip" "reinforce_with_baseline" "no_baseline")
+# 1. reinforce_with_baseline
+# 2. no_baseline
+# LOSS_TYPES=("reinforce_with_baseline" "no_baseline")
+LOSS_TYPES=( "no_baseline")
 
 # ================= 循环运行实验 =================
 for TYPE in "${LOSS_TYPES[@]}"; do
     
     # 定义具有辨识度的 Run Name
     RUN_NAME="grpo_lr${BEST_LR}_type_${TYPE}"
-    
-    # 逻辑判断：如果是 no_baseline，则关闭标准差归一化
-    if [ "$TYPE" == "no_baseline" ]; then
-        STD_NORM_ARG=""
-    else
-        # reinforce_with_baseline 模式下开启组内标准差归一化
-        STD_NORM_ARG="--use_std_normalization"
-    fi
 
     # 每一组实验创建独立的输出文件夹，防止权重覆盖
     CURRENT_OUTPUT_DIR="${OUTPUT_BASE}/${RUN_NAME}"
@@ -61,10 +53,9 @@ for TYPE in "${LOSS_TYPES[@]}"; do
         --gradient_accumulation_steps 128 \
         --epochs_per_rollout_batch 1 \
         --loss_type "$TYPE" \
-        $STD_NORM_ARG \
         --device cuda:0 \
-        --vllm_device cuda:1 \
-        --vllm_gpu_util 0.3 \
+        --vllm_device cuda:0 \
+        --vllm_gpu_util 0.25 \
         --eval_every_steps 8 \
         --save_every_steps 200 \
         --wandb_project "$WANDB_PROJECT" \

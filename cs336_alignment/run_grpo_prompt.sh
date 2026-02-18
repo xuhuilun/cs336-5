@@ -4,10 +4,14 @@
 # ================= 配置区 =================
 # 建议使用 Qwen 2.5 Math 1.5B Base 模型进行对比
 BASE_MODEL="model/Qwen2.5-Math-1.5B" 
-TRAIN_DATA="data/gsm8k/train.jsonl"
-VAL_DATA="data/gsm8k/test.jsonl"
+# TRAIN_DATA="data/gsm8k/train.jsonl"
+# VAL_DATA="data/gsm8k/test.jsonl"
+# WANDB_PROJECT="cs336-grpo-after-base-prompt"
 OUTPUT_BASE="result/ablation_prompt"
-WANDB_PROJECT="cs336-grpo-after-base-prompt"
+
+TRAIN_DATA="data/math12k/data/train-00000-of-00001.parquet"
+VAL_DATA="data/math12k/data/test-00000-of-00001.parquet"
+WANDB_PROJECT="cs336-grpo-math12k-after-base-offpolicy"
 
 BEST_LR=3e-5
 

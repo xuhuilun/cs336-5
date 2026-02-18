@@ -43,8 +43,8 @@ for NORM_TYPE in "mask_mean" "mask_normalize"; do
         --loss_type "grpo_clip" \
         --use_std_normalization \
         --device cuda:0 \
-        --vllm_device cuda:1 \
-        --vllm_gpu_util 0.25 \
+        --vllm_device cuda:0 \
+        --vllm_gpu_util 0.3 \
         --eval_every_steps 8 \
         --wandb_project "$WANDB_PROJECT" \
         --wandb_run_name "$RUN_NAME"

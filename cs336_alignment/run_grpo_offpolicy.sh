@@ -36,7 +36,7 @@ CONFIGS=(
 )
 
 # ================= 4. 硬件与通用超参 =================
-MICRO_BS=8        # 物理显存 Batch Size
+MICRO_BS=2        # 物理显存 Batch Size
 ROLLOUT_SIZE=256   # 采样总数
 GROUP_SIZE=8       # G
 N_STEPS=100        # 总迭代步数
@@ -87,7 +87,7 @@ for CFG in "${CONFIGS[@]}"; do
         --loss_type "grpo_clip" \
         --length_norm_type "mask_normalize" \
         --device cuda:0 \
-        --vllm_device cuda:1 \
+        --vllm_device cuda:0 \
         --vllm_gpu_util 0.25 \
         --eval_every_steps 8 \
         --wandb_project "$WANDB_PROJECT" \
