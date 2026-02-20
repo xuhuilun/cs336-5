@@ -225,7 +225,6 @@ def run_grpo_training(args):
         print(f">> 正在进行长度过滤 (Max: {args.max_len})...")
         
         # 1. 过滤：获取长度合格的原始索引
-        # 使用列表推导式提升代码整洁度
         valid_indices = [
             i for i, (p, r) in enumerate(zip(flat_prompts, flat_responses))
             if len(tokenizer.encode(p + r, add_special_tokens=False)) <= args.max_len
@@ -297,6 +296,21 @@ def run_grpo_training(args):
                 logical_batch_end = (update_step + 1) * args.train_batch_size
                 logical_indices = dataset_indices[logical_batch_start : logical_batch_end]
                 
+                if args.length_norm_type == "mask_dapo":
+                    # DAPO 模式：分母是当前整个逻辑 Batch 的有效 Token 总数
+                    # 此时内层函数不应再除以 accumulation_steps，因为它已经是在全局维度缩放了
+                    norm_val = all_masks[logical_indices].sum().item()
+                    acc_steps_to_pass = 1 
+                elif args.length_norm_type == "mask_normalize":
+                    # 固定常数 C (max_len)
+                    norm_val = args.max_len
+                    # 这种模式下通常需要除以梯度累积步数来平均
+                    acc_steps_to_pass = args.gradient_accumulation_steps
+                else: # mask_mean
+                    # 默认模式：由内层函数处理每个样本的 Mean
+                    norm_val = 1.0 # 这个值在 mask_mean 模式下通常不被使用
+                    acc_steps_to_pass = args.gradient_accumulation_steps
+                    
                 # 清空上一逻辑步的梯度
                 optimizer.zero_grad()
                 
@@ -305,6 +319,8 @@ def run_grpo_training(args):
                 batch_clip_frac = 0
                 batch_avg_response_entropy = 0
                 batch_avg_global_entropy = 0
+                batch_ratio_mean = 0
+                
 
                 # 3. 开启“梯度累积循环” (内层循环)
                 for micro_step in range(args.gradient_accumulation_steps):
@@ -332,14 +348,14 @@ def run_grpo_training(args):
                     _, loss_meta = grpo_microbatch_train_step(
                         policy_log_probs=res['log_probs'],
                         response_mask=mb_masks,
-                        gradient_accumulation_steps=args.gradient_accumulation_steps,
+                        gradient_accumulation_steps=acc_steps_to_pass,
                         loss_type=args.loss_type,
                         raw_rewards=mb_raw_r,
                         advantages=mb_advs,
                         old_log_probs=mb_old_lps,
                         cliprange=0.2,
                         length_norm_type=args.length_norm_type,
-                        constant_normalizer = args.max_len
+                        constant_normalizer = norm_val
                     )
                     
                     
@@ -356,6 +372,7 @@ def run_grpo_training(args):
                     batch_clip_frac += loss_meta.get('clip_fraction', 0)
                     batch_avg_response_entropy += avg_res_entropy
                     batch_avg_global_entropy += avg_global_entropy
+                    batch_ratio_mean += loss_meta.get('ratio_mean', 0)
 
                 # 4. 一个逻辑 Batch 累积完成，执行权重更新
                 grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
@@ -370,6 +387,7 @@ def run_grpo_training(args):
                         "train/grad_norm": grad_norm.item(),
                         "train/response_entropy": batch_avg_response_entropy / args.gradient_accumulation_steps,
                         "train/global_entropy": batch_avg_global_entropy / args.gradient_accumulation_steps,
+                        "train/ratio_mean": batch_ratio_mean / args.gradient_accumulation_steps,
                     }, step=step + 1) 
 
         progress_bar.update(1)

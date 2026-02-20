@@ -1,7 +1,7 @@
 # ================= 显存检查配置 =================
-GPU_ID=3
-THRESHOLD_MB=20240  # 10G = 10 * 1024 MB
-CHECK_INTERVAL=60s   # 每 60 秒检查一次
+GPU_ID=2
+THRESHOLD_MB=10240  # 10G = 10 * 1024 MB
+CHECK_INTERVAL=120s   # 每 60 秒检查一次
 
 echo "⏳ 等待 GPU:$GPU_ID 的显存占用降至 ${THRESHOLD_MB}MB 以下..."
 
@@ -21,5 +21,5 @@ done
 
 # ================= 后续执行指令 =================
 echo "🚀 启动后续任务..."
-export CUDA_VISIBLE_DEVICES='2,3'
-uv run bash cs336_alignment/run_grpo_length_norm.sh
+export CUDA_VISIBLE_DEVICES='2'
+uv run bash cs336_alignment/run_grpo_clip.sh

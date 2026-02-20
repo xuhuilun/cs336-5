@@ -11,7 +11,7 @@ OUTPUT_BASE="result/ablation_prompt"
 
 TRAIN_DATA="data/math12k/data/train-00000-of-00001.parquet"
 VAL_DATA="data/math12k/data/test-00000-of-00001.parquet"
-WANDB_PROJECT="cs336-grpo-math12k-after-base-offpolicy"
+WANDB_PROJECT="cs336-grpo-math12k-prompt"
 
 BEST_LR=3e-5
 
@@ -35,16 +35,16 @@ for STYLE in "r1_zero" "question_only"; do
         --prompt_path "$PROMPT_FILE" \
         --prompt_style "$STYLE" \
         --output_dir "${OUTPUT_BASE}/${RUN_NAME}" \
-        --n_grpo_steps 200 \
+        --n_grpo_steps 100 \
         --lr "$BEST_LR" \
         --rollout_batch_size 256 \
         --group_size 8 \
-        --gradient_accumulation_steps 32 \
+        --gradient_accumulation_steps 128 \
         --train_batch_size 256 \
-        --length_norm_type "mask_normalize" \
+        --length_norm_type "mask_mean" \
         --loss_type "grpo_clip" \
         --device cuda:0 \
-        --vllm_device cuda:1 \
+        --vllm_device cuda:0 \
         --vllm_gpu_util 0.3 \
         --eval_every_steps 8 \
         --wandb_project "$WANDB_PROJECT" \

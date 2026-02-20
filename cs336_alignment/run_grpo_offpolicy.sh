@@ -10,7 +10,8 @@ BASE_MODEL="model/Qwen2.5-Math-1.5B"
 
 TRAIN_DATA="data/math12k/data/train-00000-of-00001.parquet"
 VAL_DATA="data/math12k/data/test-00000-of-00001.parquet"
-WANDB_PROJECT="cs336-grpo-math12k-after-base-offpolicy"
+WANDB_PROJECT="cs336-grpo-math12k-offpolicy"
+WANDB_PROJECT="cs336-grpo-math12k-no_clip"
 
 PROMPT_TEMPLATE="cs336_alignment/prompts/r1_zero.prompt"
 OUTPUT_BASE="result/grpo_offpolicy_study"
@@ -18,6 +19,7 @@ OUTPUT_BASE="result/grpo_offpolicy_study"
 
 # ================= 2. 学习率锚点逻辑 =================
 # 锚点：1个 Epoch, 256 Batch 时的基准学习率
+# ANCHOR_LR="0.00003"
 ANCHOR_LR="0.00003"
 ANCHOR_BATCH=256
 
@@ -25,21 +27,21 @@ ANCHOR_BATCH=256
 # 格式为 "Epochs:TrainBatchSize"
 CONFIGS=(
     # "1:64"    
-    "2:64"    
-    "3:64" 
-    "1:128"  
-    "2:128"  
-    # "3:128" 
+    # "2:64"    
+    # "3:64" 
+    # "1:128"  
+    # "2:128"  
+    "3:128" 
     # "1:256"   
     # "2:256"   
     # "3:256"    
 )
 
 # ================= 4. 硬件与通用超参 =================
-MICRO_BS=2        # 物理显存 Batch Size
+MICRO_BS=8        # 物理显存 Batch Size
 ROLLOUT_SIZE=256   # 采样总数
 GROUP_SIZE=8       # G
-N_STEPS=100        # 总迭代步数
+N_STEPS=200        # 总迭代步数
 SEED=42
 
 # ================= 5. 循环执行实验 =================
@@ -53,14 +55,15 @@ for CFG in "${CONFIGS[@]}"; do
     IFS=":" read -r E TB <<< "$CFG"
 
     # --- 关键逻辑：动态计算超参数 ---
-    # 1. 计算学习率: LR = Anchor_LR * (TB / Anchor_Batch)
-    LR=$(awk "BEGIN {print $ANCHOR_LR * ($TB/$ANCHOR_BATCH)}")
+    # 1. 计算学习率
+    # LR=$(awk "BEGIN {print $ANCHOR_LR * ($TB/$ANCHOR_BATCH)}")
+    LR=$(awk "BEGIN {print $ANCHOR_LR * ($TB/$ANCHOR_BATCH) / sqrt($E)}")
     
     # 2. 计算梯度累积步数: AccumSteps = TB / MicroBS
     ACCUM_STEPS=$((TB / MICRO_BS))
     
     # 3. 构造运行名称
-    RUN_NAME="E${E}_TB${TB}_LR${LR}_no-std"
+    RUN_NAME="E${E}_TB${TB}_LR${LR}"
     CURRENT_OUTPUT_DIR="${OUTPUT_BASE}/${RUN_NAME}"
 
     echo "========================================================="
@@ -85,7 +88,6 @@ for CFG in "${CONFIGS[@]}"; do
         --gradient_accumulation_steps "$ACCUM_STEPS" \
         --epochs_per_rollout_batch "$E" \
         --loss_type "grpo_clip" \
-        --length_norm_type "mask_normalize" \
         --device cuda:0 \
         --vllm_device cuda:0 \
         --vllm_gpu_util 0.25 \
@@ -93,7 +95,8 @@ for CFG in "${CONFIGS[@]}"; do
         --wandb_project "$WANDB_PROJECT" \
         --wandb_run_name "$RUN_NAME" \
         --seed "$SEED" \
-        # --use_std_normalization # 默认开启标准差归一化
+        --length_norm_type "mask_normalize" \
+        --use_std_normalization 
 
     # 错误处理
     if [ $? -ne 0 ]; then

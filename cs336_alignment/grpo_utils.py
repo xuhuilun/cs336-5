@@ -172,15 +172,25 @@ def compute_grpo_no_clip_loss(
     # 注意：advantages 形状为 (B, 1)，会广播到 (B, L)
     loss = -(ratio * advantages)
     
+
     # 3. 记录元数据用于监控比率爆炸情况
     with torch.no_grad():
+        surr1 = ratio * advantages
+        cliprange = 0.2
+        ratio_clipped = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+        surr2 = ratio_clipped * advantages
+
+        # 计算截断比例
+        clipped_mask = (surr2 < surr1).float()
+        clip_fraction = clipped_mask.mean()
+        
         metadata = {
             "ratio_mean": ratio.mean(),
             "ratio_max": ratio.max(),
             "ratio_min": ratio.min(),
-            "clip_fraction": torch.tensor(0.0).to(ratio.device) # 既然没截断，比例始终为 0
+            "clip_fraction": clip_fraction,
         }
-        
+
     return loss, metadata
 
 
@@ -375,7 +385,7 @@ def masked_mean(
     mask_count = torch.sum(mask, dim=dim)
     
     return masked_sum / mask_count
-
+"""
 def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
@@ -386,7 +396,7 @@ def grpo_microbatch_train_step(
     old_log_probs: Optional[torch.Tensor] = None,
     cliprange: Optional[float] = None,
     constant_normalizer: Optional[float] = None,
-    length_norm_type="mask_mean" # 可选: "mask_mean" 或 "mask_normalize"
+    length_norm_type="mask_mean" # 可选: "mask_mean" ，"mask_normalize"，"mask_dapo"
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
     # 1. 计算 Per-token Loss
@@ -430,7 +440,67 @@ def grpo_microbatch_train_step(
     metadata.update(loss_metadata)
     
     return scaled_loss, metadata
+"""
 
+def grpo_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
+    raw_rewards: Optional[torch.Tensor] = None,
+    advantages: Optional[torch.Tensor] = None,
+    old_log_probs: Optional[torch.Tensor] = None,
+    cliprange: Optional[float] = None,
+    constant_normalizer: Optional[float] = None,
+    length_norm_type="mask_mean" # "mask_mean", "mask_normalize", "mask_dapo"
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+    # 1. 计算 Per-token Loss (Batch, Seq)
+    per_token_loss, loss_metadata = compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange
+    )
+    
+    # 2. 聚合 Loss (Aggregation)
+    if length_norm_type == "mask_dapo":
+        # --- DAPO 逻辑：全局 Token 平均 ---
+        # 直接计算当前 micro-batch 的所有有效 token 的 loss 总和
+        # 然后除以【外部传入的逻辑 Batch Token 总数】
+        # 注意：这里不需要再除以 microbatch_size 或 gradient_accumulation_steps
+        # 因为 constant_normalizer 已经是全局分母了
+        total_masked_loss = (per_token_loss * response_mask).sum()
+        scaled_loss = total_masked_loss / (constant_normalizer + 1e-8)
+        
+        # 为了方便日志观察，我们转回一个类似于平均 loss 的值
+        microbatch_loss = scaled_loss * gradient_accumulation_steps 
+
+    elif length_norm_type == "mask_normalize":
+        # --- Constant 逻辑：除以固定常数 C ---
+        # 这种模式下，你需要维持原有的步长缩放逻辑
+        per_example_loss = (per_token_loss * response_mask).sum(dim=1) / constant_normalizer
+        microbatch_loss = per_example_loss.mean()
+        scaled_loss = microbatch_loss / gradient_accumulation_steps
+
+    else: # mask_mean
+        # --- 默认逻辑：句子内 Token 平均 ---
+        per_example_loss = masked_mean(per_token_loss, response_mask, dim=1)
+        microbatch_loss = per_example_loss.mean()
+        scaled_loss = microbatch_loss / gradient_accumulation_steps
+    
+    # 3. 反向传播
+    scaled_loss.backward()
+    
+    # 4. 准备元数据
+    metadata = {
+        "loss": microbatch_loss.detach(),
+    }
+    metadata.update(loss_metadata)
+    
+    return scaled_loss, metadata
 
 def log_generations(
     vllm_model: LLM,
