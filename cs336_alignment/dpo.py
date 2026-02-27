@@ -18,7 +18,7 @@ import wandb
 HH_PATH = "data/hh-rlhf"
 OUTPUT_DIR = "result/dpo_qwen_3b_sft"
 POLICY_MODEL_PATH  = "result/sft_qwen_3b_ultraChat_SafetyLlama/checkpoint-6300"
-REFERENCE_MODEL_PATH = "model/Qwen2.5-3B"
+REFERENCE_MODEL_PATH = "result/sft_qwen_3b_ultraChat_SafetyLlama/checkpoint-6300"
 max_length = 512
 train_batch_size = 64
 gradient_accumulation_steps = 16
