@@ -13,6 +13,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 from unittest.mock import patch
 
+
+
 # --- 导入自定义工具函数 ---
 from cs336_alignment.sft_utils import (
     tokenize_prompt_and_output, 
@@ -197,11 +199,14 @@ def run_grpo_training(args):
         flat_responses = []
         flat_golds = []
         
+
         for i, output in enumerate(outputs):
             for candidate in output.outputs:
                 flat_prompts.append(prompts[i])
                 flat_responses.append(candidate.text)
                 flat_golds.append(golds[i])
+
+        
         
         # 计算 Advantage
         advantages, raw_rewards, reward_meta = compute_group_normalized_rewards(

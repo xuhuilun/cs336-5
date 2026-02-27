@@ -2,7 +2,7 @@ import os
 from openai import OpenAI
 
 # 1. 配置 vLLM 地址 (请确保端口号与你部署时一致，默认通常是 8000)
-VLLM_BASE_URL = "http://localhost:8010/v1"
+VLLM_BASE_URL = "http://localhost:8011/v1"
 
 client = OpenAI(
     base_url=VLLM_BASE_URL,
@@ -32,11 +32,10 @@ def interactive_chat():
         if user_input.lower() in ["exit", "quit"]:
             break
 
-        print("\n助手正在思考...", end="\r")
-
         try:
 
-            prompt_template_path = 'cs336_alignment/prompts/question_only.prompt'
+            # prompt_template_path = 'cs336_alignment/prompts/question_only.prompt'
+            prompt_template_path = 'cs336_alignment/prompts/alpaca_sft.prompt'
             # prompt_template_path = 'cs336_alignment/prompts/question_only_fewshot.prompt'
             with open(prompt_template_path, "r") as f:
                 prompt_template = f.read()
@@ -44,9 +43,8 @@ def interactive_chat():
             response = client.completions.create(
                 model=model_name,
                 prompt=full_prompt,
-                max_tokens=800,
-                temperature=0.01,
-                # stop=["</answer>"] # 强制在答案结束后停止
+                max_tokens=1000,
+                temperature=0.75,
             )
 
             result = response.choices[0].text

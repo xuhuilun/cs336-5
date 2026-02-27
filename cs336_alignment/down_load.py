@@ -4,10 +4,10 @@ from huggingface_hub import snapshot_download
 def download_dataset():
     # 数据集在 HF 上的 ID
     # repo_id = "garg-aayush/sft-cs336-assign5-datasets"
-    # repo_id = "openbmb/UltraChat"
     # repo_id = "TIGER-Lab/MMLU-Pro"
     # repo_id = "Anthropic/hh-rlhf"
-    repo_id = "hiyouga/math12k"
+    # repo_id = "hiyouga/math12k"
+    repo_id = "HuggingFaceH4/ultrachat_200k"
     
     # 本地保存的目标目录
     local_dir = f"data/{repo_id.split('/')[-1]}"
@@ -43,7 +43,9 @@ def download_dataset():
 
 def download_model():
     # 作业中使用的是 Base 版本
-    repo_id = "Qwen/Qwen2.5-3B"
+    # repo_id = "Qwen/Qwen2.5-3B"
+    # repo_id = "Qwen/Qwen2.5-14B-Instruct"
+    repo_id = "Qwen/Qwen2.5-32B-Instruct"
     
     # 本地保存路径
     local_dir = "model/" + repo_id.split('/')[-1]
@@ -66,6 +68,6 @@ def download_model():
         print(f"下载过程中出错: {e}")
 
 if __name__ == "__main__":
-    # download_model()
+    download_model()
 
-    download_dataset()
+    # download_dataset()

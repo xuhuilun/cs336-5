@@ -2,167 +2,155 @@ import os
 import json
 import time
 import re
-import random
-import datasets
+import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
 
-# --- 配置 ---
-VLLM_API_URL = "http://localhost:8010/v1"
+# ================= 配置区 =================
+VLLM_API_URL = "http://localhost:8011/v1"
 DATA_PATH = "data/MMLU-Pro/data/test-00000-of-00001.parquet"
-MODEL_NAME = "Qwen2.5-7B-Instruct"
-# MODEL_NAME = "Qwen2.5-7B-Base"
-# 确保 result 目录存在
-os.makedirs("result", exist_ok=True)
-OUTPUT_FILE = f"result/mmlu-pro_{MODEL_NAME}_baseline_results.json"
-MAX_WORKERS = 300
+MODEL_NAME = "Qwen2.5-3B-Base"
+# OUTPUT_FILE = f"result/mmlu-pro_{MODEL_NAME}_baseline_raw_results.json"
+OUTPUT_FILE = f"result/mmlu-pro_{MODEL_NAME}_SFT_raw_results.json"
+MAX_WORKERS = 100
 
-# 初始化 OpenAI 客户端
-client = OpenAI(base_url=VLLM_API_URL, api_key="vllm-token")
-random.seed(42)
+client = OpenAI(base_url=VLLM_API_URL, api_key="empty")
 
-def form_options(options: list):
-    """格式化 A-J 选项"""
-    option_str = 'Options are:\n'
-    opts = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']
-    for opt, o in zip(options, opts):
-        option_str += f'({o}): {opt}' + '\n'
-    return option_str
+# 1. 官方指定的统一 System Prompt (PDF 第2页)
+SYSTEM_PROMPT = (
+    "Below is a list of conversations between a human and an AI assistant (you).\n"
+    "Users place their queries under \"# Query:\", and your responses are under \"# Answer:\".\n"
+    "You are a helpful, respectful, and honest assistant.\n"
+    "You should always answer as helpfully as possible while ensuring safety.\n"
+    "Your answers should be well-structured and provide detailed information. They should also have an engaging tone.\n"
+    "Your responses must not contain any fake, harmful, unethical, racist, sexist, toxic, dangerous, or illegal content, even if it may be helpful.\n"
+    "Your response must be socially responsible, and thus you can reject to answer some controversial topics."
+)
 
-def get_prediction(output):
-    """从模型生成的 CoT 内容中提取答案 (A-J)"""
-    # 匹配 "The answer is (A)" 或 "answer is A"
-    pattern = r"answer is \(?([ABCDEFGHIJ])\)?"
-    match = re.search(pattern, output, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    else:
-        # 备选逻辑：寻找文本中出现的最后一个独立的 A-J 字母
-        alt_pattern = r"\b([A-J])\b"
-        matches = re.findall(alt_pattern, output)
-        if matches:
-            return matches[-1].upper()
-        return random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
+# 2. MMLU-Pro 任务特定的提示词模板 (遵循 PDF 第3页风格)
+MMLU_PRO_TASK_TEMPLATE = (
+    "Answer the following multiple choice question about {subject}. Respond with a single "
+    "sentence of the form \"The correct answer is _\", filling the blank with the letter "
+    "corresponding to the correct answer (i.e., A, B, C, D, E, F, G, H, I, or J).\n\n"
+    "Question: {question}\n"
+    "{options_str}\n"
+    "Answer:"
+)
 
-def call_vllm_api(query):
-    """调用 API 进行零样本推理"""
+# ================= 工具函数 =================
+
+def form_options_str(options: list) -> str:
+    """格式化选项列表"""
+    labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']
+    return "\n".join([f"{l}. {t}" for l, t in zip(labels, options)])
+
+def parse_mmlu_pro_response(model_response: str) -> str | None:
+    """解析输出，提取 A-J 选项"""
+    if not model_response: return None
+    # 优先匹配题目要求的标准格式: "The correct answer is X"
+    match_std = re.search(r"[Tt]he correct answer is\s*([A-J])", model_response)
+    if match_std: return match_std.group(1).upper()
+    # 备选：匹配文本中出现的第一个 A-J（Base 模型有时直接给字母）
+    match_alt = re.search(r"\b([A-J])\b", model_response)
+    if match_alt: return match_alt.group(1).upper()
+    return None
+
+def call_vllm_raw_api(full_prompt: str) -> str:
+    """使用 client.completions 调用 Base 模型，不带对话模版干扰"""
     try:
-        response = client.chat.completions.create(
+        response = client.completions.create(
             model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a knowledge expert. Please reason step by step and then derive your final answer as `The answer is (X)` at the end."
-                },
-                {
-                    "role": "user",
-                    "content": query
-                }
-            ],
-            temperature=0.0,
-            max_tokens=2048, 
+            prompt=full_prompt,
+            temperature=0.0, # Greedy Decoding
+            max_tokens=64,   # MMLU 只需要短输出
             top_p=1.0,
+            # 停止符：防止模型写完答案后复读题目或开启新一轮 Query
+            stop=["# Query:", "```", "\n\n#"] 
         )
-        return response.choices[0].message.content
+        return response.choices[0].text
     except Exception as e:
         return f"ERROR: {str(e)}"
 
-def process_entry(entry):
-    """处理单个样本"""
-    query = 'Q: ' + entry['question'] + '\n' + form_options(entry['options']) + '\n'
+def process_entry(entry: dict):
+    """构建完全符合作业 PDF 格式要求的 Raw Prompt"""
     
-    answer = call_vllm_api(query)
+    # 构建具体的任务内容
+    options_formatted = form_options_str(entry['options'])
+    instruction_content = MMLU_PRO_TASK_TEMPLATE.format(
+        subject=entry['category'],
+        question=entry['question'],
+        options_str=options_formatted
+    )
     
-    if "ERROR" in answer:
-        return {"error": answer, "entry": entry}
+    full_raw_prompt = f"{SYSTEM_PROMPT}\n{instruction_content}"
+
+    raw_output = call_vllm_raw_api(full_raw_prompt)
+    
+    if "ERROR" in raw_output:
+        return {"error": raw_output, "category": entry['category']}
         
-    prediction = get_prediction(answer)
-    # entry['answer'] 已经是 'A', 'B' 等字符
+    prediction = parse_mmlu_pro_response(raw_output)
     is_correct = (entry["answer"] == prediction)
     
     return {
         "category": entry['category'],
-        "question": entry['question'],
         "gold": entry["answer"],
         "prediction": prediction,
-        "solution": answer,
+        "output": raw_output,
         "is_correct": is_correct
     }
 
+# ================= 主程序 =================
+
 def main():
-    # 1. 加载本地数据 (使用 Pandas 避开 datasets 库的本地加载 Bug)
-    print(f"Loading MMLU-Pro test set from {DATA_PATH}...")
-    if not os.path.exists(DATA_PATH):
-        print(f"Error: File not found at {DATA_PATH}")
-        return
-        
+    # 1. 加载数据
+    print(f"正在加载 MMLU-Pro 数据集: {DATA_PATH}...")
     df = pd.read_parquet(DATA_PATH)
     test_entries = df.to_dict('records')
-    print(f"Successfully loaded {len(test_entries)} examples.")
+    print(f"成功加载 {len(test_entries)} 条测试数据。")
 
-    categories = ['computer science', 'math', 'chemistry', 'engineering', 'law', 'biology',
-                  'health', 'physics', 'business', 'philosophy', 'economics', 'other',
-                  'psychology', 'history']
-
+    # 2. 执行并发评估
     all_results = []
-    per_category_accuracy = {c: [0, 0] for c in categories} # [正确数, 总数]
-
-    # 2. 预检查服务器
-    try:
-        client.models.list()
-        print("Connected to vLLM server.")
-    except Exception as e:
-        print(f"Connection failed: {e}")
-        return
-
-    # 3. 多线程并发请求
-    print(f"Starting Zero-shot inference with {MAX_WORKERS} workers...")
+    print(f"正在启动 Base 模型零样本评测 (并发数: {MAX_WORKERS})...")
     start_time = time.time()
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_entry = {executor.submit(process_entry, entry): entry for entry in test_entries}
-        
-        for future in tqdm(as_completed(future_to_entry), total=len(test_entries)):
-            res = future.result()
-            
-            if "error" in res:
-                continue
-                
-            all_results.append(res)
-            cat = res['category']
-            if cat in per_category_accuracy:
-                per_category_accuracy[cat][1] += 1
-                if res['is_correct']:
-                    per_category_accuracy[cat][0] += 1
+        future_to_entry = {executor.submit(process_entry, e): e for e in test_entries}
+        for future in tqdm(as_completed(future_to_entry), total=len(test_entries), desc="MMLU-Pro"):
+            all_results.append(future.result())
 
     duration = time.time() - start_time
 
-    # 4. 计算并打印统计结果
-    print('\n' + '='*60)
-    print(f"{'Category':25s} | {'Accuracy':10s} | {'Correct/Total'}")
-    print('-'*60)
-    
-    total_correct = 0
-    total_count = 0
-    
-    for cat in categories:
-        corr, total = per_category_accuracy[cat]
-        acc = corr / total if total > 0 else 0
-        print(f"{cat:25s} | {acc:10.4f} | {corr}/{total}")
-        total_correct += corr
-        total_count += total
-    
-    overall_acc = total_correct / total_count if total_count > 0 else 0
-    print('='*60)
-    print(f"Overall Accuracy: {overall_acc:.4f}")
-    print(f"Time: {duration/60:.2f} mins | Throughput: {total_count/duration:.2f} q/s")
+    # 3. 结果汇总
+    valid_results = [r for r in all_results if "error" not in r]
+    total_corr = sum(1 for r in valid_results if r["is_correct"])
+    overall_acc = total_corr / len(valid_results) if valid_results else 0
 
-    # 5. 保存结果到磁盘
+    # 4. 打印报告
+    cat_stats = {}
+    for res in valid_results:
+        cat = res['category']
+        if cat not in cat_stats: cat_stats[cat] = [0, 0]
+        cat_stats[cat][1] += 1
+        if res['is_correct']: cat_stats[cat][0] += 1
+
+    print('\n' + '='*60)
+    print(f"{'Category':25s} | {'Accuracy':10s} | {'Count'}")
+    print('-'*60)
+    for cat in sorted(cat_stats.keys()):
+        corr, cnt = cat_stats[cat]
+        print(f"{cat:25s} | {corr/cnt:10.2%} | {cnt}")
+    
+    print('='*60)
+    print(f"Overall Baseline Accuracy: {overall_acc:.2%}")
+    print(f"Throughput: {len(valid_results)/duration:.2f} samples/s")
+
+    # 5. 保存结果
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
-    print(f"\nResults saved to: {OUTPUT_FILE}")
+        json.dump({"metrics": {"accuracy": overall_acc}, "details": all_results}, f, indent=2, ensure_ascii=False)
+    print(f"\n结果已保存至: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()

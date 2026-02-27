@@ -1,22 +1,25 @@
 import os
 import json
 import time
+import re
 import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any
+
+# --- 导入解析工具 ---
+# 确保该函数能处理从文本中提取最后一个数字的逻辑
 from cs336_alignment.parse_utils import parse_gsm8k_response
 
-# --- 配置 ---
+# ================= 配置区 =================
 VLLM_API_URL = "http://localhost:8010/v1"
-# MODEL_NAME = "Qwen2.5-7B-Base" # 对应你 serve 时的别名
-MODEL_NAME = "Qwen2.5-7B-Instruct"
+MODEL_NAME = "Qwen2.5-3B-Base"
 DATA_PATH = "data/gsm8k/test.jsonl"
-OUTPUT_FILE = f"result/gsm8k_{MODEL_NAME}_baseline_results.json"
+OUTPUT_FILE = f"result/gsm8k_{MODEL_NAME}_SFT_results.json"
 MAX_WORKERS = 100
 
-client = OpenAI(base_url=VLLM_API_URL, api_key="empty")
-
+# 官方指定的统一 System Prompt
 SYSTEM_PROMPT = (
     "Below is a list of conversations between a human and an AI assistant (you).\n"
     "Users place their queries under \"# Query:\", and your responses are under \"# Answer:\".\n"
@@ -27,83 +30,141 @@ SYSTEM_PROMPT = (
     "Your response must be socially responsible, and thus you can reject to answer some controversial topics."
 )
 
-def load_gsm8k_data(file_path):
+client = OpenAI(base_url=VLLM_API_URL, api_key="empty")
+
+# ================= 工具函数 =================
+
+def load_gsm8k_data(file_path: str) -> List[Dict[str, Any]]:
+    """加载 GSM8K 测试集"""
     items = []
-    with open(file_path, "r") as f:
+    if not os.path.exists(file_path):
+        print(f"Error: File not found {file_path}")
+        return []
+    with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             ex = json.loads(line)
-            # 这里的 question 是原始题目
-            user_query = f"{ex['question']}\nAnswer:"
-            # 组装作业要求的格式
-            full_prompt = f"{SYSTEM_PROMPT}\n\n# Query:\n```\n{user_query}\n```\n\n# Answer:\n```\n"
-            
-            # GSM8K 答案通常在 'answer' 字段，形式如 "... #### 72"
+            # 提取标准答案数字（GSM8K 格式为 "推理过程 #### 数字"）
             gold_str = ex['answer'].split("####")[-1].strip().replace(",", "")
-            
             items.append({
-                "prompt": full_prompt,
-                "gold": float(gold_str),
-                "original_question": ex['question']
+                "question": ex['question'],
+                "gold": float(gold_str)
             })
     return items
 
-def call_api(item):
+def call_vllm_api(item: Dict[str, Any]) -> Dict[str, Any]:
+    """使用 client.completions.create 进行原始文本补全推理"""
+    question = item["question"]
+    
+    full_raw_prompt =  f"{SYSTEM_PROMPT}\n{question}\nAnswer:"
+
     try:
-        # GSM8K 需要生成推理过程，max_tokens 设为 512
-        response = client.chat.completions.create(
+        # 使用 completions 接口直接发送原始字符串
+        response = client.completions.create(
             model=MODEL_NAME,
-            messages=[{"role": "user", "content": item["prompt"]}],
-            temperature=0.0,
-            max_tokens=512,
+            prompt=full_raw_prompt,
+            temperature=0.0,  # 官方要求：Greedy Decoding
+            max_tokens=512,   # 足够容纳推理过程
+            # 停止符：防止 Base 模型在输出答案后复读题目或伪造对话
+            stop=["# Query:", "```", "\n\n#", "User:", "Assistant:"] 
         )
-        gen_text = response.choices[0].message.content
-        pred = parse_gsm8k_response(gen_text)
+        
+        # 获取生成内容 (Completions 接口使用 .text)
+        gen_text = response.choices[0].text
+        
+        # 使用解析工具提取数字
+        pred_str = parse_gsm8k_response(gen_text)
+        
+        pred_val = None
+        is_correct = False
+        
+        if pred_str is not None:
+            try:
+                pred_val = float(pred_str)
+                if pred_val == item["gold"]:
+                    is_correct = True
+            except ValueError:
+                pred_val = None
+
         return {
-            "question": item["original_question"],
+            "question": question,
             "gold": item["gold"],
-            "pred": pred,
+            "pred": pred_val,
             "output": gen_text,
-            "is_correct": (pred == item["gold"])
+            "is_correct": is_correct
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "question": question}
+
+# ================= 主程序 =================
 
 def main():
-    # 1. 加载数据
+    # 1. 准备数据
     all_items = load_gsm8k_data(DATA_PATH)
-    print(f"Loaded {len(all_items)} GSM8K questions.")
+    if not all_items:
+        return
+    print(f"🚀 已加载 {len(all_items)} 个 GSM8K 测试题目。")
 
-    # 2. 并发评估
+    # 2. 并发评估逻辑
     all_results = []
     start_time = time.time()
 
+    print(f"正在调用 {MODEL_NAME} 进行原始补全评测 (并发数: {MAX_WORKERS})...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(call_api, item): item for item in all_items}
-        for future in tqdm(as_completed(futures), total=len(all_items)):
+        # 提交任务
+        future_to_item = {executor.submit(call_vllm_api, item): item for item in all_items}
+        
+        # 收集结果
+        for future in tqdm(as_completed(future_to_item), total=len(all_items)):
             res = future.result()
-            if "error" not in res:
+            if res and "error" not in res:
                 all_results.append(res)
+            elif res:
+                print(f"\n警告: 请求失败 -> {res['error']}")
 
     duration = time.time() - start_time
 
-    # 3. 统计指标
-    correct = sum(1 for r in all_results if r["is_correct"])
-    parse_failed = sum(1 for r in all_results if r["pred"] is None)
-    accuracy = correct / len(all_results)
+    # 3. 结果分析与统计
+    if not all_results:
+        print("❌ 未收集到任何有效结果，请检查 vLLM 服务状态。")
+        return
+
+    correct_count = sum(1 for r in all_results if r["is_correct"])
+    parse_failed_count = sum(1 for r in all_results if r["pred"] is None)
+    total_evaluated = len(all_results)
     
+    accuracy = correct_count / total_evaluated
+    throughput = total_evaluated / duration
+
     metrics = {
+        "model": MODEL_NAME,
         "accuracy": accuracy,
-        "throughput_ex_per_sec": len(all_results) / duration,
-        "parsing_failure_count": parse_failed,
-        "total_examples": len(all_results)
+        "throughput_samples_per_sec": throughput,
+        "parsing_failure_count": parse_failed_count,
+        "total_evaluated": total_evaluated,
+        "total_original": len(all_items)
     }
 
-    # 4. 保存
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump({"metrics": metrics, "details": all_results}, f, indent=2)
+    # 4. 序列化保存
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "config": {
+                "method": "client.completions",
+                "model": MODEL_NAME,
+                "temperature": 0.0,
+                "stop_sequences": ["# Query:", "```"]
+            },
+            "metrics": metrics, 
+            "details": all_results
+        }, f, indent=2, ensure_ascii=False)
 
-    print(f"\nGSM8K Accuracy: {accuracy:.4f}")
-    print(f"Throughput: {metrics['throughput_ex_per_sec']:.2f} samples/s")
+    print("\n" + "="*40)
+    print(f"📊 评测完成！")
+    print(f"模型: {MODEL_NAME}")
+    print(f"准确率 (Accuracy): {accuracy:.2%}")
+    print(f"吞吐量 (Throughput): {throughput:.2f} samples/s")
+    print(f"结果已保存至: {OUTPUT_FILE}")
+    print("="*40)
 
 if __name__ == "__main__":
     main()
