@@ -27,7 +27,7 @@ lr = 1e-6
 epochs = 1
 beta = 0.1
 eval_interval = 20
-save_interval = 500
+save_interval = 100
 policy_device = "cuda:0"
 reference_device = "cuda:0"
 
@@ -229,7 +229,10 @@ def train_dpo():
                     print(f"[Eval] Step {step} | Acc: {v_acc:.4f} | Margin: {v_margin:.4f}")
 
                 if step % save_interval == 0:
-                    policy_model.save_pretrained(os.path.join(OUTPUT_DIR, f"checkpoint-{step}"))
+                    checkpoint_path = os.path.join(OUTPUT_DIR, f"checkpoint-{step}")
+                    print(f"Saving checkpoint to {checkpoint_path}...")
+                    policy_model.save_pretrained(checkpoint_path)
+                    tokenizer.save_pretrained(checkpoint_path)
 
     wandb.finish()
 

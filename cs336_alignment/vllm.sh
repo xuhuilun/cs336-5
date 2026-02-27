@@ -1,12 +1,12 @@
 # export CUDA_VISIBLE_DEVICES='2'
-vllm serve model/Qwen2.5-Math-1.5B \
-    --served-model-name Qwen2.5-Math-1.5B \
-    --tensor-parallel-size 1 \
-    --dtype bfloat16 \
-    --gpu-memory-utilization 0.3 \
-    --max-model-len 2000 \
-    --host 0.0.0.0 \
-    --port 8010
+# vllm serve model/Qwen2.5-Math-1.5B \
+#     --served-model-name Qwen2.5-Math-1.5B \
+#     --tensor-parallel-size 1 \
+#     --dtype bfloat16 \
+#     --gpu-memory-utilization 0.3 \
+#     --max-model-len 2000 \
+#     --host 0.0.0.0 \
+#     --port 8010
 
 # export CUDA_VISIBLE_DEVICES='2'
 # vllm serve model/Qwen2.5-3B \
@@ -28,15 +28,15 @@ vllm serve model/Qwen2.5-Math-1.5B \
 #     --host 0.0.0.0 \
 #     --port 8010
 
-export CUDA_VISIBLE_DEVICES='1'
-vllm serve model/Qwen2.5-14B-Instruct \
-    --served-model-name Qwen2.5-14B-Instruct \
-    --tensor-parallel-size 1 \
-    --dtype bfloat16 \
-    --gpu-memory-utilization 0.7 \
-    --max-model-len 5000 \
-    --host 0.0.0.0 \
-    --port 8010
+# export CUDA_VISIBLE_DEVICES='1'
+# vllm serve model/Qwen2.5-14B-Instruct \
+#     --served-model-name Qwen2.5-14B-Instruct \
+#     --tensor-parallel-size 1 \
+#     --dtype bfloat16 \
+#     --gpu-memory-utilization 0.7 \
+#     --max-model-len 5000 \
+#     --host 0.0.0.0 \
+#     --port 8010
 
 # export CUDA_VISIBLE_DEVICES='1'
 # vllm serve model/Qwen2.5-32B-Instruct \
@@ -76,3 +76,13 @@ vllm serve model/Qwen2.5-14B-Instruct \
 #     --max-model-len 2000 \
 #     --host 0.0.0.0 \
 #     --port 8011
+
+export CUDA_VISIBLE_DEVICES='2'
+vllm serve result/dpo_qwen_3b_sft/step_100 \
+    --served-model-name Qwen2.5-3B-DPO \
+    --tensor-parallel-size 1 \
+    --dtype bfloat16 \
+    --gpu-memory-utilization 0.5 \
+    --max-model-len 2000 \
+    --host 0.0.0.0 \
+    --port 8010
