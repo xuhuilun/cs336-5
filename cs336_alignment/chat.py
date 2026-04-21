@@ -9,6 +9,7 @@ client = OpenAI(
     api_key="empty",
 )
 
+
 def get_model_name():
     """获取当前 vLLM 正在服务的模型名称"""
     try:
@@ -18,6 +19,7 @@ def get_model_name():
         print(f"无法连接到 vLLM 服务: {e}")
         exit()
 
+
 def interactive_chat():
     model_name = get_model_name()
     print(f"已连接到服务！当前模型: {model_name}")
@@ -26,20 +28,21 @@ def interactive_chat():
     while True:
         # 获取终端输入
         user_input = input("\n用户: ").strip()
-        
+
         if not user_input:
             continue
         if user_input.lower() in ["exit", "quit"]:
             break
 
         try:
-
             # prompt_template_path = 'cs336_alignment/prompts/question_only.prompt'
-            prompt_template_path = 'cs336_alignment/prompts/alpaca_sft.prompt'
+            prompt_template_path = "cs336_alignment/prompts/alpaca_sft.prompt"
             # prompt_template_path = 'cs336_alignment/prompts/question_only_fewshot.prompt'
             with open(prompt_template_path, "r") as f:
                 prompt_template = f.read()
+            # 替换模板中的 {question}
             full_prompt = prompt_template.replace("{question}", user_input)
+
             response = client.completions.create(
                 model=model_name,
                 prompt=full_prompt,
@@ -49,9 +52,10 @@ def interactive_chat():
 
             result = response.choices[0].text
             print(f"助手: {result}")
-            
+
         except Exception as e:
             print(f"\n请求出错: {e}")
+
 
 if __name__ == "__main__":
     interactive_chat()
