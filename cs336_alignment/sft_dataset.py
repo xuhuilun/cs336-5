@@ -3,7 +3,15 @@ import gzip
 import torch
 import random
 from torch.utils.data import Dataset
-
+"""
+指令微调：
+1. 数据加载与预处理
+2. 模版定义
+3. input_ids与labels
+4. 自回归训练的特殊性：输入和标签的对齐关系
+5. 数据块的 Packing 与 Shift 逻辑
+6. “死区”剔除 (Filtering Invalid Chunks)：仅含有prompt token的块无法产生梯度，必须丢弃
+"""
 class InstructionDataset(Dataset):
     def __init__(self, tokenizer, dataset_path, seq_length: int, shuffle: bool, apply_masking: bool = True):
         self.tokenizer = tokenizer
@@ -41,8 +49,9 @@ class InstructionDataset(Dataset):
         
         print("Tokenizing and applying masks...")
         
-        # 4. 编码与掩码
+        # 4. 对于每一条json训练数据进行编码与掩码
         for i, doc in enumerate(docs):
+            # 提取 Prompt 和 Response，兼容不同字段命名
             p = doc.get("prompt", doc.get("instruction", ""))
             r = doc.get("response", doc.get("output", ""))
             
@@ -52,13 +61,13 @@ class InstructionDataset(Dataset):
             
             # 标签初始化（默认等于 input_ids）
             labels = list(full_tokens)
-            
+            # 应用掩码，避免大模型学习提示词
             if self.apply_masking:
                 # 仅 Prompt 编码
                 prompt_text = template.format(prompt=p, response="")
                 prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
                 
-                # 安全检查：确保前缀完全一致
+                # 安全检查：确保前缀完全一致，避免将部分开头的答案屏蔽
                 if full_tokens[:len(prompt_tokens)] != prompt_tokens:
                     print(f"Warning: Tokenization mismatch at index {i}. Masking might be slightly off.")
                 
@@ -89,6 +98,7 @@ class InstructionDataset(Dataset):
             raise ValueError(f"Dataset is too small! Total tokens ({len(all_token_ids)}) < required chunk size ({chunk_size})")
 
         # 截断多余的部分并变形
+        # 即使chunk里面存在两种以上语义，大模型通过eos学到
         input_chunks = all_token_ids[:num_chunks * chunk_size].view(num_chunks, chunk_size)
         label_chunks = all_label_ids[:num_chunks * chunk_size].view(num_chunks, chunk_size)
 
@@ -101,6 +111,7 @@ class InstructionDataset(Dataset):
         # 7. “死区”剔除 (Filtering Invalid Chunks)
         # 检查每个序列的 Labels：如果一整行全都是 -100，说明这 chunk_size 个 token 全是 Prompt
         # 这种数据无法产生梯度，必须丢弃。
+        # 布尔类型的列表
         valid_chunk_mask = (self.final_labels != -100).any(dim=1)
         
         total_dropped = num_chunks - valid_chunk_mask.sum().item()
