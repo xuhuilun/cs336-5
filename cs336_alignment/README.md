@@ -125,9 +125,10 @@
   - 监控Response Entropy
 - **适合**：理解SFT的基本流程
 
-### 11. `train_sft_step.py`
+### 11. `train_sft_step.py` 可运行
 - **作用**：Step-based SFT训练
 - **特点**：
+  - 基于step训练，随机从整个数据集取，模拟无限数据流
   - 一次性预分词整个数据集（速度快）
   - 使用infinite dataloader逻辑（随机采样）
   - 基于step的评估和保存

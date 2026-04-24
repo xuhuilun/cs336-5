@@ -167,10 +167,11 @@ def run_evaluation(model, eval_loader):
             if i >= max_batches: break
             input_ids, labels = batch["input_ids"].to(model.device), batch["labels"].to(model.device)
             logits = model(input_ids).logits
+            # logits: [B, L, V] -> [B*L, V], labels: [B, L] -> [B*L]
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
             total_loss += loss.item()
             count += 1
     return total_loss / max(1, count)
-
+# 只有直接运行 sft.py 时才会执行 main()，被导入时不会执行
 if __name__ == "__main__":
     main()

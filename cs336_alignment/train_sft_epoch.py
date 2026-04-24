@@ -22,7 +22,7 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 # ==========================================
 # VLLM 初始化与权重同步辅助函数
 # ==========================================
-
+# 基于epoch的训练逻辑/每次取micro_batch_size个样本进行前向和反向传播，完成一个逻辑 Batch 的梯度累积后更新参数
 def init_vllm(model_id, device, seed, gpu_memory_utilization):
     with patch("torch.distributed.get_world_size", return_value=1), \
          patch("vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None):
