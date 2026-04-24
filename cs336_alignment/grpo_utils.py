@@ -130,6 +130,7 @@ def compute_naive_policy_gradient_loss(
 
     Args:
         raw_rewards_or_advantages: 形状为 (batch_size, 1) 的张量。
+            每个问题有batch_size个回答，这里每个回答对应一个奖励或优势分。
             代表每个生成的回答对应的奖励或优势分。
             对于 GRPO/REINFORCE，通常整句话的所有 token 共享同一个优势值。
         
@@ -177,11 +178,13 @@ def compute_grpo_no_clip_loss(
     with torch.no_grad():
         surr1 = ratio * advantages
         cliprange = 0.2
+        # 进行截断，但不应用于损失计算，仅用于监控
         ratio_clipped = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
         surr2 = ratio_clipped * advantages
 
         # 计算截断比例
         clipped_mask = (surr2 < surr1).float()
+        # 计算被截断的 token 占总 token 的比例
         clip_fraction = clipped_mask.mean()
         
         metadata = {
@@ -204,10 +207,10 @@ def compute_grpo_clip_loss(
     计算 GRPO-Clip 损失函数。
     
     该函数实现了 PPO/GRPO 的核心安全机制：通过限制新旧策略的比率(Ratio)，
-    防止模型在单次更新中变化过大，从而保证训练的稳定性。
+    防止模型在单次更新中变化过大，严重脱离原模型，从而保证训练的稳定性。
 
     Args:
-        advantages: 组内归一化后的优势值，形状 (batch_size, 1)。
+        advantages: 组内归一化后的优势值，形状 (batch_size, 1)。每组问题的batch_size个回答共享同一个优势值。
         policy_log_probs: 当前正在优化的策略的对数概率，形状 (batch_size, sequence_length)。
         old_log_probs: 采样时旧策略的对数概率，形状 (batch_size, sequence_length)。
         cliprange: 截断阈值 epsilon (如 0.2)，定义了 [1-eps, 1+eps] 的“安全区”。
@@ -219,6 +222,7 @@ def compute_grpo_clip_loss(
     
     # 1. 计算概率比率 ratio = exp(log_prob_new - log_prob_old)
     # 使用对数空间相减再取指数，是为了保证在处理极小概率时的数值稳定性，防止下溢出。
+    # 如果直接计算 p_new / p_old，可能会因为概率过小而导致数值不稳定。比如 p_old = 1e-10，可能float直接为0，导致 ratio 无法计算。
     log_ratio = policy_log_probs - old_log_probs
     ratio = torch.exp(log_ratio)
     
@@ -286,9 +290,9 @@ def compute_policy_gradient_loss(
     """
 
     metadata = {}
-
+    # 根据 loss_type 调用不同的计算函数
     if loss_type == "no_baseline":
-        # 断言检查：确保传入了必要的原始奖励
+        # 断言检查：确保传入了必要的原始奖励，没有baseline，无法计算优势
         assert raw_rewards is not None, "no_baseline 模式必须提供 raw_rewards"
         
         # 使用朴素公式：Loss = -raw_reward * log_prob
@@ -302,11 +306,12 @@ def compute_policy_gradient_loss(
         assert advantages is not None, "reinforce_with_baseline 模式必须提供 advantages"
         
         # 使用朴素公式：Loss = -advantage * log_prob
+        # baseline 已经被预先从 raw_rewards 中减去并归一化了，所以这里直接使用优势值进行加权。
         loss = compute_naive_policy_gradient_loss(
             raw_rewards_or_advantages=advantages,
             policy_log_probs=policy_log_probs
         )
-
+    # 截断/重要性采样相关的损失函数
     elif loss_type == "grpo_clip":
         # 断言检查：GRPO 需要比率计算所需的 old_log_probs 和 clip 参数
         assert advantages is not None, "grpo_clip 模式必须提供 advantages"
@@ -355,7 +360,7 @@ def masked_normalize(
     """
     # 将 tensor 与 mask 相乘，排除 mask == 0 的元素
     masked_tensor = tensor * mask
-    
+    # 计算求和，会把dim维度消除掉
     total_sum = torch.sum(masked_tensor, dim=dim)
         
     #  除以归一化常数
@@ -473,6 +478,7 @@ def grpo_microbatch_train_step(
         # 注意：这里不需要再除以 microbatch_size 或 gradient_accumulation_steps
         # 因为 constant_normalizer 已经是全局分母了
         total_masked_loss = (per_token_loss * response_mask).sum()
+        # 归一化后的 loss 是一个标量，token level
         scaled_loss = total_masked_loss / (constant_normalizer + 1e-8)
         
         # 为了方便日志观察，我们转回一个类似于平均 loss 的值
@@ -481,14 +487,18 @@ def grpo_microbatch_train_step(
     elif length_norm_type == "mask_normalize":
         # --- Constant 逻辑：除以固定常数 C ---
         # 这种模式下，你需要维持原有的步长缩放逻辑
+        # 先计算每个样本的总 loss（token sum），再除以 constant_normalizer 得到平均 loss，维度为 (Batch,)
         per_example_loss = (per_token_loss * response_mask).sum(dim=1) / constant_normalizer
         microbatch_loss = per_example_loss.mean()
+        # 梯度累加
         scaled_loss = microbatch_loss / gradient_accumulation_steps
 
     else: # mask_mean
-        # --- 默认逻辑：句子内 Token 平均 ---
+        # --- 默认逻辑：句子内 Token 平均，每个样本梯度贡献一样 ---
         per_example_loss = masked_mean(per_token_loss, response_mask, dim=1)
+        # microbatch_loss 是所有样本的平均 loss，适合直接观察训练曲线
         microbatch_loss = per_example_loss.mean()
+        # scaled_loss的维度是标量，适合直接反向传播
         scaled_loss = microbatch_loss / gradient_accumulation_steps
     
     # 3. 反向传播
@@ -498,6 +508,7 @@ def grpo_microbatch_train_step(
     metadata = {
         "loss": microbatch_loss.detach(),
     }
+    # 合并底层 Loss 函数的元数据（如 clip_fraction）
     metadata.update(loss_metadata)
     
     return scaled_loss, metadata
@@ -527,6 +538,7 @@ def log_generations(
     
     # 2. 逐条处理生成结果
     for i, output in enumerate(outputs):
+        # 大模型生成的回答文本
         generated_text = output.outputs[0].text
         gold_answer = ground_truths[i]
         

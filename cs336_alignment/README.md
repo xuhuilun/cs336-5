@@ -107,9 +107,10 @@
   - `log_generations()`: GRPO专用的生成日志记录
 - **关键概念**：
   - **Group Normalization**: 同一问题的多个回答之间做归一化
-  - **Advantage**: (reward - mean) / std
+  - **Advantage**: (reward - mean) / std，避免std过于小造成震荡，也可以（reward - mean）
   - **Clip机制**: 限制新旧策略比率在[0.8, 1.2]之间
   - **长度归一化类型**: mask_mean / mask_normalize / mask_dapo
+  - 样本公平/token公平
 
 ---
 

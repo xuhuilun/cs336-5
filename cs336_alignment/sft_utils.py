@@ -40,7 +40,7 @@ def tokenize_prompt_and_output(
     all_response_masks = []
     all_lengths = []
 
-    # 1. 分别对每一对进行分词
+    # 1. 分别对每一组Prompt和Response进行分词
     for p_str, o_str in zip(prompt_strs, output_strs):
         # 注意：add_special_tokens=False，因为我们手动拼接
         # 有些分词器在开头会自动加 BOS，需根据具体模型调整
@@ -70,7 +70,7 @@ def tokenize_prompt_and_output(
 
     for i, (ids, m) in enumerate(zip(all_input_ids, all_response_masks)):
         length = len(ids)
-        # 这里使用右填充 (Right Padding)
+        # 这里使用右填充 (Right Padding)，将原本的 ids 放在前面，剩余部分填充 pad_id
         padded_input_ids[i, :length] = torch.tensor(ids)
         padded_masks[i, :length] = torch.tensor(m)
 
@@ -78,9 +78,11 @@ def tokenize_prompt_and_output(
     # input_ids: 取前 N-1 个
     # labels: 取后 N-1 个 (偏移一位)
     # response_mask: 对应 labels 的位置，所以也取后 N-1 个
-    
+    # 根据padded_input_ids，生成input_ids和labels
     final_input_ids = padded_input_ids[:, :-1]
+    # 复制一份，深拷贝，以免修改 input_ids 时影响到 labels
     final_labels = padded_input_ids[:, 1:].clone()
+
     final_response_mask = padded_masks[:, 1:]
 
     # 5. 可选：将 labels 中非 response 部分及 padding 部分设为特殊值（如 -100）
@@ -107,7 +109,7 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
         torch.Tensor, 形状为 (batch_size, sequence_length)
         每个位置的 next-token 预测熵。
     """
-    # 1. 计算 Log-Sum-Exp (LSE)
+    # 1. 计算 Log-Sum-Exp (LSE) LSE大于max（logits）
     # 形状: (batch_size, sequence_length)
     lse = torch.logsumexp(logits, dim=-1)
     
@@ -134,7 +136,7 @@ def get_response_log_probs(
     """
     获取模型生成的每个 token 的条件对数概率，并可选地返回熵。
     """
-    # 1. 获取模型输出的 logits
+    # 1. 获取模型输出的 logits，还未进行嵌入层
     # input_ids shape: (batch_size, seq_len)
     # labels shape: (batch_size, seq_len)
     outputs = model(input_ids)
@@ -234,7 +236,9 @@ def sft_microbatch_train_step(
     # 5. 返回结果
     # 第一个元素返回 scaled_loss 用于测试对比
     # 第二个元素记录未缩放之前的 microbatch 平均 loss 用于日志
+    # detach切断反向传播的梯度流，避免在日志记录时对计算图造成干扰
     metadata = {
+        # detach返回一个不带梯度的新视图，不影响反向梯度传播的主视图，适合记录和日志输出
         "loss": microbatch_loss_mean.detach(),
     }
 
@@ -271,6 +275,8 @@ def log_generations(
     
     # 2. 逐条处理生成结果
     for i, output in enumerate(outputs):
+        # output：RequestOutput 对象，包含生成的文本等信息
+        # output.outputs 是一个列表，每个元素是一个 CompletionOutput 对象，包含 text 属性
         generated_text = output.outputs[0].text
         gold_answer = ground_truths[i]
         

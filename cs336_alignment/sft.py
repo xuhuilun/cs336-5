@@ -47,8 +47,10 @@ def main():
 
     # --- 3. 数据流水线 ---
     # 使用之前实现的带 -100 Mask 的 Dataset
+    # shuffle防止每个 epoch 内样本顺序完全一样，增加训练多样性
+    # 避免样本梯度高度相关，然后突然反方向，导致的训练不稳定
     train_ds = InstructionDataset(tokenizer, args.train_path, args.max_seq_len, shuffle=True)
-    train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size, shuffle=True)
+    train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size, shuffle=True,drop_last=True)
 
     eval_loader = None
     if args.eval_path:
@@ -57,11 +59,13 @@ def main():
 
     # --- 4. 优化器与学习率调度器 ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
-    
+    # 受限于显存，我们通常设置 micro_batch_size < batch_size，进行梯度累积
+    # 物理上每 step 处理 micro_batch_size 个样本，但逻辑上每 step 更新前会累积 batch_size 个样本的梯度
     grad_accum_steps = max(1, args.batch_size // args.micro_batch_size)
     total_steps = (len(train_loader) // grad_accum_steps) * args.epochs
-    
+    # 学习率调度器：线性 warmup + 余弦衰减
     scheduler = get_cosine_schedule_with_warmup(
+        # 优化器：如何更新模型参数
         optimizer,
         num_warmup_steps=int(args.warmup_ratio * total_steps),
         num_training_steps=total_steps
@@ -70,14 +74,14 @@ def main():
     # --- 5. 训练主循环 ---
     print(f"训练: 总计 {total_steps} 更新步 | 累积步数: {grad_accum_steps}")
     progress_bar = tqdm(total=total_steps, desc="SFT Training")
-    
+    # 进入训练模式，启用 dropout 等训练特有的机制
     model.train()
     optimizer.zero_grad()
     
     accumulated_loss = 0
     accumulated_entropy = 0
     global_step = 0
-
+    # 训练轮次
     for epoch in range(args.epochs):
         for idx, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(model.device)
@@ -112,11 +116,12 @@ def main():
 
             # --- C. 参数更新（触发条件：完成一个逻辑 Batch） ---
             if (idx + 1) % grad_accum_steps == 0:
+                # 计算L2范数并裁剪，防止梯度爆炸，全局梯度裁剪，同比例缩放
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 
                 optimizer.step()    # 应用梯度
                 scheduler.step()    # 更新学习率（修改 optimizer 内部的 param_groups）
-                optimizer.zero_grad() # 清空现场
+                optimizer.zero_grad() # 清空梯度，为下一轮累积做准备
                 
                 global_step += 1
                 
