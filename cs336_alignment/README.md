@@ -148,7 +148,7 @@
 
 ## 第四阶段：高级算法（Advanced Algorithms）
 
-### 13. `dpo.py` ⭐⭐ 偏好学习
+### 13. `dpo.py` ⭐⭐ 偏好学习 可运行
 - **作用**：Direct Preference Optimization实现
 - **核心逻辑**：
   - 加载HH-RLHF偏好数据

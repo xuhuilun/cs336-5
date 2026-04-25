@@ -31,6 +31,7 @@ save_interval = 100
 policy_device = "cuda:0"
 reference_device = "cuda:0"
 
+# 返回的格式为 {"instruction": str, "chosen": str, "rejected": str} 的列表
 def load_hh_dataset():
     filenames = ["harmless-base/train.jsonl.gz",
                  "helpful-base/train.jsonl.gz",
@@ -48,6 +49,7 @@ def load_hh_dataset():
                 if len(c_msg) == 2 and len(r_msg) == 2 and c_msg[0] == r_msg[0]:
                     all_examples.append({"instruction": c_msg[0], "chosen": c_msg[1], "rejected": r_msg[1]})
     random.shuffle(all_examples)
+    # 95% 用于训练，5% 用于验证
     split = int(len(all_examples) * 0.95)
     return all_examples[:split], all_examples[split:]
 
@@ -60,7 +62,7 @@ class HHPreferenceDataset(Dataset):
 
     def __len__(self):
         return len(self.examples)
-    
+    # 返回 input_ids, attention_mask, prompt_end_index
     def _process_tokens(self, prompt_tokens, response_tokens):
         """
         处理单条序列的核心逻辑：拼接 -> 截断 -> 左填充
@@ -70,13 +72,15 @@ class HHPreferenceDataset(Dataset):
         
         # 2. 计算在截断后的序列中，Prompt 占了多少长度
         # 如果 Response 特别长，导致 Prompt 被完全截断，则 p_len 为 0
+        # 可能为负数：如果response长度超过 max_length，导致 prompt 完全被截断，此时实际 p_len 应为 0
         actual_p_len = max(0, len(full_tokens) - len(response_tokens))
         
         # 3. 计算左填充长度
         pad_len = self.max_length - len(full_tokens)
         
-        # 4. 构建 Tensor
+        # 4. 构建 Tensor，左填充 pad_token_id，右侧是实际的 full_tokens
         input_ids = [self.tokenizer.pad_token_id] * pad_len + full_tokens
+        # 掩码：左侧填充部分为 0，实际内容部分为 1
         attention_mask = [0] * pad_len + [1] * len(full_tokens)
         
         # 5. 计算 Prompt 在整个 input_ids 序列中的结束位置
@@ -96,14 +100,16 @@ class HHPreferenceDataset(Dataset):
         prompt = tmpl.format(ex["instruction"])
         
         p_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+        # embedding and 手动添加 EOS Token，确保模型能正确识别序列结束
         c_tokens = self.tokenizer.encode(ex["chosen"] + self.tokenizer.eos_token, add_special_tokens=False)
         r_tokens = self.tokenizer.encode(ex["rejected"] + self.tokenizer.eos_token, add_special_tokens=False)
 
-        # 分别处理 chosen 和 rejected
+        # 分别处理 chosen 和 rejected 的token
         c_ids, c_mask, c_p_len = self._process_tokens(p_tokens, c_tokens)
         r_ids, r_mask, r_p_len = self._process_tokens(p_tokens, r_tokens)
 
         return {
+            # 这里的 c_ids 和 r_ids 都是已经过拼接、截断、左填充处理后的完整序列，模型输入时直接使用即可
             "chosen_input_ids": c_ids,
             "chosen_attention_mask": c_mask,
             "chosen_prompt_len": c_p_len,
@@ -115,16 +121,21 @@ class HHPreferenceDataset(Dataset):
 
 def compute_response_log_probs(logits, input_ids, attention_mask, prompt_lengths):
     log_probs = F.log_softmax(logits, dim=-1)
+    # 形状：[batch_size, seq_len, vocab_size]
     shift_log_probs = log_probs[:, :-1, :]
+    # 预测下一个 token
     shift_input_ids = input_ids[:, 1:]
     shift_attention_mask = attention_mask[:, 1:]
+    # 通过 gather 从 log_probs 中提取出正确的对应 input_ids 的 log_prob，得到形状 [batch_size, seq_len-1]
     token_log_probs = torch.gather(shift_log_probs, dim=2, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
-    
+    # 构建一个 mask，确保我们只计算 Response 部分的 log_prob
     response_mask = torch.zeros_like(shift_attention_mask)
     for i in range(token_log_probs.shape[0]):
         response_mask[i, prompt_lengths[i]-1:] = 1
-    
+    # 既是有效token（不包含填充），又是 Response 部分的 token，才参与 log_prob 的计算
     combined_mask = shift_attention_mask * response_mask
+    # 返回每条序列的 Response log_prob 总和，以及 Response 的 token 数量（用于后续计算平均 log_prob）
+    # 归一化：总 log_prob 除以 Response token 数量，得到平均 log_prob
     return (token_log_probs * combined_mask).sum(dim=1), combined_mask.sum(dim=1)
 
 def train_dpo():
@@ -154,7 +165,7 @@ def train_dpo():
     train_ex, val_ex = load_hh_dataset()
     train_loader = DataLoader(HHPreferenceDataset(train_ex, tokenizer, max_length), batch_size=micro_batch_size, shuffle=True)
     val_loader = DataLoader(HHPreferenceDataset(val_ex, tokenizer, max_length), batch_size=micro_batch_size, shuffle=False)
-
+    # 选择rmsprop优化器，适合微调语言模型，平滑更新，减少震荡
     optimizer = torch.optim.RMSprop(policy_model.parameters(), lr=lr)
     
     step = 0
@@ -173,6 +184,7 @@ def train_dpo():
             c_logits = policy_model(c_ids, attention_mask=c_mask).logits
             r_logits = policy_model(r_ids, attention_mask=r_mask).logits
             with torch.no_grad():
+                # 参考模型的前向传播也放在 no_grad 环境下，节省显存
                 c_logits_ref = ref_model(c_ids.to(reference_device), attention_mask=c_mask.to(reference_device)).logits.to(policy_device)
                 r_logits_ref = ref_model(r_ids.to(reference_device), attention_mask=r_mask.to(reference_device)).logits.to(policy_device)
 
@@ -186,18 +198,21 @@ def train_dpo():
             c_reward = beta * (c_lp - c_lp_ref)
             r_reward = beta * (r_lp - r_lp_ref)
             loss = -F.logsigmoid(c_reward - r_reward).mean()
-
+            # 梯度累积
             (loss / gradient_accumulation_steps).backward()
 
             # 指标收集 (detach 以释放显存)
             step_metrics["loss"] += loss.item() / gradient_accumulation_steps
             step_metrics["chosen_reward"] += c_reward.mean().item() / gradient_accumulation_steps
             step_metrics["rejected_reward"] += r_reward.mean().item() / gradient_accumulation_steps
+            # margin 和 acc 是基于 reward 差值的指标，反映模型区分优劣回答的能力
             step_metrics["margin"] += (c_reward - r_reward).mean().item() / gradient_accumulation_steps
             step_metrics["acc"] += (c_reward > r_reward).float().mean().item() / gradient_accumulation_steps
 
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
+
                 torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
+                # 梯度更新
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
