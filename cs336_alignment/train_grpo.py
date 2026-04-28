@@ -28,8 +28,9 @@ from cs336_alignment.grpo_utils import (
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 
 # ==========================================
-# 辅助函数
+# 数据预处理
 # ==========================================
+# 加载Math12K数据集和GSM8K数据集的函数，返回包含 prompt 和 gold answer 的列表
 def load_math12k_dataset(path, prompt_template=None):
     df = pd.read_parquet(path)
     processed_items = []
@@ -59,7 +60,11 @@ def load_gsm8k_dataset(path, prompt_template=None):
             })
     return processed_items
 
-
+"""
+off policy：训练和采样离线
+policy model：训练模型，可更新参数
+reference model：初始化vllm实例，加速推理，rollout采样
+"""
 def init_vllm(model_id, device, seed, gpu_memory_utilization):
     """初始化 vLLM 实例"""
     with patch("torch.distributed.get_world_size", return_value=1), \
@@ -72,7 +77,7 @@ def init_vllm(model_id, device, seed, gpu_memory_utilization):
             gpu_memory_utilization=gpu_memory_utilization,
             seed=seed
         )
-
+# 加载模型权重到 vLLM 实例中，确保两者权重同步
 def load_policy_into_vllm_instance(policy, llm):
     """同步权重"""
     state_dict = policy.state_dict()
@@ -82,7 +87,7 @@ def load_policy_into_vllm_instance(policy, llm):
 
 
 # ==========================================
-# GRPO 核心训练逻辑
+# GRPO 核心训练逻辑，多轮rollout采样和grpo训练
 # ==========================================
 
 def run_grpo_training(args):
@@ -91,11 +96,12 @@ def run_grpo_training(args):
     micro_train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
     
     assert args.rollout_batch_size % args.group_size == 0
-    
+    # 每个 Rollout Batch 中的 Prompt 数量 = 总采样数量 / 每组的候选数量
+    # 一次rollout会采样 args.rollout_batch_size 个候选答案，这些候选答案被分成若干组，每组有 args.group_size 个候选答案。每组对应一个 prompt，因此 prompt 的数量是总采样数量除以每组的候选数量。
     n_prompts_per_rollout = args.rollout_batch_size // args.group_size
     
     wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
-    
+    # 根据选择的提示词风格，确定使用哪个奖励函数
     if args.prompt_style == "question_only":
         active_reward_fn = question_only_reward_fn
         print("Using [Question-Only] reward function.")
@@ -106,7 +112,7 @@ def run_grpo_training(args):
     print(f"Loading prompt template from {args.prompt_path}...")
     with open(args.prompt_path, "r") as f:
         prompt_template = f.read().strip()
-
+    # 根据训练数据路径自动加载对应的数据集和验证集，并应用相同的提示词模板进行处理，得到包含 prompt 和 gold answer 的列表
     if 'math12k' in args.train_data_path.lower():
         questions_pool = load_math12k_dataset(args.train_data_path, prompt_template)
         val_samples = load_math12k_dataset(args.test_data_path, prompt_template)[:args.max_eval_samples]
@@ -135,9 +141,10 @@ def run_grpo_training(args):
         torch_dtype=torch.bfloat16, 
         attn_implementation="flash_attention_2"
     ).to(args.device)
-    # 开启梯度检查点
+
+    # 开启梯度检查点，在前向传播时不保存中间激活，反向传播时重新计算以节省显存
     policy.gradient_checkpointing_enable()
-    
+    # 优化器：定义如何更新参数
     optimizer = AdamW(policy.parameters(), lr=args.lr, weight_decay=0.0)
 
     print(f"Initializing vLLM on {args.vllm_device}...")
@@ -162,6 +169,8 @@ def run_grpo_training(args):
         log_prefix="eval"
     )
     print(f"[GRPO Step 0] Initial Eval Accuracy: {metrics.get('eval/accuracy', 0):.2%}")
+    
+    
     policy.train() 
 
     # ==========================================
@@ -169,7 +178,7 @@ def run_grpo_training(args):
     # ==========================================
     # 4. GRPO 主循环
     global_step = 0
-    # 训练采样参数
+    # 训练rollout采样参数
     rollout_sampling_params = SamplingParams(
         n=args.group_size,
         temperature=args.sampling_temperature,
@@ -185,22 +194,27 @@ def run_grpo_training(args):
         # ==========================================
         # Phase 1: 采样 (Rollout)
         # ==========================================
+
         policy.eval()
         load_policy_into_vllm_instance(policy, vllm_inst)
-        
+        # 从问题池中随机采样当前批次的 prompt，数量 = 每个 Rollout Batch 中的 Prompt 数量
         current_batch_questions = random.sample(questions_pool, n_prompts_per_rollout)
         prompts = [q['prompt'] for q in current_batch_questions]
         golds = [q['gold'] for q in current_batch_questions]
         
-        # vLLM 生成
+        # vLLM 生成大模型输出，得到每个 prompt 对应的多个候选答案（总数 = 每个 Rollout Batch 中的 Prompt 数量 * 每组的候选数量）
+        # params.n 是每个 prompt 生成的候选答案数量，这里设置为 args.group_size，确保每个 prompt 都有固定数量的候选答案，方便后续分组计算奖励和优势。
         outputs = vllm_inst.generate(prompts, rollout_sampling_params)
         
+
+        # 将所有展开为一维
         flat_prompts = []
         flat_responses = []
         flat_golds = []
         
-
+        # outputs 是一个列表，每个元素对应一个 prompt 的生成结果，其中包含多个候选答案。我们需要将这些候选答案展平为一个大列表，以便后续计算奖励和训练。
         for i, output in enumerate(outputs):
+            # 遍历候选答案集合
             for candidate in output.outputs:
                 flat_prompts.append(prompts[i])
                 flat_responses.append(candidate.text)
@@ -250,17 +264,19 @@ def run_grpo_training(args):
         else:
             final_indices = valid_indices
 
-        # 3. 同步更新文本列表与奖励张量
+        # 3. 经过过滤长度大于max_len的样本，同步更新文本列表与奖励张量
+        # 经过过滤后的prompt和response
         filtered_prompts = [flat_prompts[i] for i in final_indices]
         filtered_responses = [flat_responses[i] for i in final_indices]
         
-        # 必须先基于索引对 Tensor 进行切片，再移动到 GPU
+        # 必须先基于索引对 Tensor 进行切片，再移动到 GPU，否则可能会把全部数据加载到显存，这里仅加载采样的数据
         # 注意：此处切片会自动处理重采样导致的重复行
         advantages = advantages[final_indices].to(args.device)
         raw_rewards = raw_rewards[final_indices].to(args.device)
 
         # 4. 张量化 (Tokenization)
         all_inputs = tokenize_prompt_and_output(filtered_prompts, filtered_responses, tokenizer)
+        # Shift操作
         all_input_ids = all_inputs['input_ids'].to(args.device)
         all_labels = all_inputs['labels'].to(args.device)
         all_masks = all_inputs['response_mask'].to(args.device)
@@ -271,11 +287,15 @@ def run_grpo_training(args):
         policy.eval()
         with torch.no_grad(): # 关键：确保精度与训练阶段(BF16)完全一致
             old_log_probs_list = []
+            # 由于一次性计算整个批次的 log_probs 可能会显存不足，我们按 Micro-batch 大小分块计算并拼接结果
             for i in range(0, all_input_ids.size(0), micro_train_batch_size):
                 batch_ids = all_input_ids[i : i + micro_train_batch_size]
                 batch_lbls = all_labels[i : i + micro_train_batch_size]
                 res = get_response_log_probs(policy, batch_ids, batch_lbls)
+                # 链表，后续cat将其转化为张量
                 old_log_probs_list.append(res['log_probs'])
+            # 从维度上拼接所有 Micro-batch 的 log_probs，得到整个 Rollout Batch 的 log_probs 张量
+            # 链表式拼接：每个元素都是一个 Micro-batch 的 log_probs，最终得到一个大张量，形状为 [total_samples]
             old_log_probs = torch.cat(old_log_probs_list, dim=0)
 
         del old_log_probs_list # 显式删除不再需要的中间大列表
@@ -283,7 +303,9 @@ def run_grpo_training(args):
         # ==========================================
         # Phase 3: 训练 
         # ==========================================
+        # 采样后的训练阶段，使用之前准备好的数据进行 GRPO 训练
         actual_train_size = all_input_ids.size(0)
+        # 样本总数 // 更新一次梯度所需的批次大小
         num_updates_per_epoch = actual_train_size // args.train_batch_size
         
         if num_updates_per_epoch == 0:
@@ -291,14 +313,16 @@ def run_grpo_training(args):
             continue
 
         policy.train()
+        # 对rollout采样数据进行多轮训练
         for epoch in range(args.epochs_per_rollout_batch):
-            # 打乱实际训练样本的索引
+            # 打乱实际训练样本的索引，创建新的
             dataset_indices = np.random.permutation(actual_train_size)
-            
+            # 样本数据可以进行几次梯度更新
             for update_step in range(num_updates_per_epoch):
                 # 2. 锁定当前“逻辑 Batch”的索引范围
                 logical_batch_start = update_step * args.train_batch_size
                 logical_batch_end = (update_step + 1) * args.train_batch_size
+
                 logical_indices = dataset_indices[logical_batch_start : logical_batch_end]
                 
                 if args.length_norm_type == "mask_dapo":
@@ -348,7 +372,7 @@ def run_grpo_training(args):
                     )
                     
                     # --- C. 执行单步微批次更新 (包含 backward) ---
-                    # 注意：函数内部执行了 scaled_loss.backward()
+                    # 注意：函数内部执行了 scaled_loss.backward() 反向传播但没有梯度更新
                     # 梯度会累加在参数的 .grad 中
                     _, loss_meta = grpo_microbatch_train_step(
                         policy_log_probs=res['log_probs'],
@@ -360,6 +384,7 @@ def run_grpo_training(args):
                         old_log_probs=mb_old_lps,
                         cliprange=0.2,
                         length_norm_type=args.length_norm_type,
+                        # 三种不同的常数缩放和acc steps to pass相关
                         constant_normalizer = norm_val
                     )
                     
@@ -372,7 +397,7 @@ def run_grpo_training(args):
                         avg_res_entropy = token_entropy[current_res_mask].mean().item() if current_res_mask.any() else 0.0
                         avg_global_entropy = token_entropy[valid_token_mask].mean().item()
                     
-                    # 累加指标用于后续 WandB
+                    # micro batch 累加指标用于后续 WandB
                     batch_loss += loss_meta['loss'].item()
                     batch_clip_frac += loss_meta.get('clip_fraction', 0)
                     batch_avg_response_entropy += avg_res_entropy
@@ -394,7 +419,7 @@ def run_grpo_training(args):
                         "train/global_entropy": batch_avg_global_entropy / args.gradient_accumulation_steps,
                         "train/ratio_mean": batch_ratio_mean / args.gradient_accumulation_steps,
                     }, step=step + 1) 
-
+        # n轮采样，结束一轮采样进度条更新+1
         progress_bar.update(1)
         torch.cuda.empty_cache()
 
@@ -403,9 +428,11 @@ def run_grpo_training(args):
         # ==========================================
         
         # 1. 评估逻辑 (每隔 args.eval_every_steps 个 GRPO Step)
+        # 每隔eval_every_steps采样+训练，进行一次评估
         if (step + 1) % args.eval_every_steps == 0:
             print(f"\n[GRPO Step {step + 1}] Starting Evaluation...")
             policy.eval() 
+            # 将训练好的policy model同步到vllm，然后进行推理
             load_policy_into_vllm_instance(policy, vllm_inst)
             
             metrics = log_generations(
@@ -427,7 +454,7 @@ def run_grpo_training(args):
             os.makedirs(save_path, exist_ok=True)
             policy.save_pretrained(save_path)
             tokenizer.save_pretrained(save_path)
-
+    # n轮采样+训练全部完成！
     print("GRPO Training Finished.")
     wandb.finish()
 

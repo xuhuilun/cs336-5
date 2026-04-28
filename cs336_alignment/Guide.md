@@ -161,6 +161,10 @@
   - accuracy（chosen_reward > rejected_reward的比例）
 
 ### 14. `train_grpo.py` ⭐⭐⭐ 核心算法
+n轮采样
+  每次采样进行多个epoch
+    逻辑batch size个样本才更新一次梯度
+        但受限于显卡，每次训练micro_batch_size
 - **作用**：GRPO完整训练流程
 - **核心流程（4个Phase）**：
   1. **Phase 1 - Rollout**: 使用vLLM生成回答（group_size个/问题）
